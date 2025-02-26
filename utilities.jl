@@ -98,6 +98,20 @@ mutable struct QPBlockData{T}
     end
 end
 
+function MOI.empty!(block::QPBlockData) 
+    empty!(constraints)
+    empty!(g_L)
+    empty!(g_U)
+    empty!(mult_g)
+    empty!(function_type)
+    empty!(bound_type)
+    empty!(parameters)
+end
+
+function MOI.is_empty(block::QPBlockData)
+    return empty(block.constraints)
+end
+
 function _value(variable::MOI.VariableIndex, x::Vector, p::Dict)
     if _is_parameter(variable)
         return p[variable.value]
