@@ -47,3 +47,4 @@ function rks_step!(integrator::RK45Integrator, state::Vector{Float64}, gradient_
         axpy!(η / 6.0, integrator.scratch[1], state, range)
     end
 end
+

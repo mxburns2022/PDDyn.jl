@@ -266,7 +266,6 @@ const CacheModel = MOI.Utilities.GenericModel{
         # Set K of allowable values
         SetOfZeros{Float64}
     },
-    MOI.Utilities.Quad
 }
 
 function MOI.add_constrained_variables(model::CacheModel, set::MOI.Nonnegatives)

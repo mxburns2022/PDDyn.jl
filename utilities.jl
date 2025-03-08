@@ -98,18 +98,18 @@ mutable struct QPBlockData{T}
     end
 end
 
-function MOI.empty!(block::QPBlockData) 
-    empty!(constraints)
-    empty!(g_L)
-    empty!(g_U)
-    empty!(mult_g)
-    empty!(function_type)
-    empty!(bound_type)
-    empty!(parameters)
+function MOI.empty!(block::QPBlockData{T}) where {T}
+    empty!(block.constraints)
+    empty!(block.g_L)
+    empty!(block.g_U)
+    empty!(block.mult_g)
+    empty!(block.function_type)
+    empty!(block.bound_type)
+    empty!(block.parameters)
 end
 
-function MOI.is_empty(block::QPBlockData)
-    return empty(block.constraints)
+function MOI.is_empty(block::QPBlockData{T}) where {T}
+    return size(block.constraints)[1] == 0
 end
 
 function _value(variable::MOI.VariableIndex, x::Vector, p::Dict)
