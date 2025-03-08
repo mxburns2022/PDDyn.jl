@@ -1,5 +1,13 @@
 include("PDDyn.jl")
+using PowerModels
 import LinearAlgebra as linalg
+import MathOptInterface.Utilities as MOIU
+
+using Random
+rng = MersenneTwister(123)
+
+
+
 
 mutable struct Optimizer <: MOI.AbstractOptimizer
     # Structures storing problem data
@@ -13,6 +21,8 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     iterations::Int
 
     # Problem state
+    variable_ubounds::Vector{Float64}
+    variable_lbounds::Vector{Float64}
     primal::Vector{Float64}
     dual::Vector{Float64}
     solve_time::Float64
@@ -31,6 +41,8 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
             Dict{MOI.ConstraintIndex, Int}(),
             1e-4,
             1_000,
+            Float64[],
+            Float64[],
             Float64[],
             Float64[],
             0.0,
@@ -61,24 +73,18 @@ end
 function MOI.supports_constraint(
     ::Optimizer,
     ::Type{MOI.VariableIndex},
-    ::Type{<:Union{MOI.LessThan,MOI.GreaterThan,MOI.EqualTo}},
+    ::Type{<:Union{MOI.LessThan{Float64},MOI.GreaterThan{Float64},MOI.EqualTo{Float64}}},
 )
     return true
 end
 function MOI.supports_constraint(
     ::Optimizer,
-    ::Type{MOI.ScalarAffineFunction},
-    ::Type{<:Union{MOI.LessThan,MOI.GreaterThan,MOI.EqualTo}},
+    ::Type{<:Union{MOI.ScalarAffineFunction{Float64}, MOI.ScalarQuadraticFunction{Float64}}},
+    ::Type{<:Union{MOI.LessThan{Float64},MOI.GreaterThan{Float64},MOI.EqualTo{Float64}}},
 )
     return true
 end
-function MOI.supports_constraint(
-    ::Optimizer,
-    ::Type{MOI.ScalarQuadraticFunction},
-    ::Type{<:Union{MOI.LessThan,MOI.GreaterThan}},
-)
-    return true
-end
+
 
 function MOI.supports(
     ::Optimizer,
@@ -133,8 +139,18 @@ end
 function MOI.add_constraint(
         model::Optimizer, 
         cons::Union{MOI.ScalarAffineFunction{Float64}, MOI.ScalarQuadraticFunction{Float64}}, 
-        constraintset::Union{MOI.EqualTo, MOI.LessThan, MOI.GreaterThan})
+        constraintset::Union{MOI.EqualTo{Float64}, MOI.LessThan{Float64}, MOI.GreaterThan{Float64}})
+        println(cons, constraintset)
     MOI.add_constraint(model.qpblock, cons, constraintset)
+end
+function MOI.add_constraint(
+    model::Optimizer, 
+    cons::MOI.VariableIndex, 
+    constraintset::Union{MOI.EqualTo{Float64}, MOI.LessThan{Float64}, MOI.GreaterThan{Float64}})
+    v = cons.value
+    _, l, u,_,_ = _set_info(constraintset)
+    model.variable_ubounds[v] = u
+    model.variable_lbounds[v] = l
 end
 function MOI.set(
         model::Optimizer, 
@@ -176,24 +192,60 @@ const CacheModel = MOI.Utilities.GenericModel{
         SetOfZeros{Float64}
     },
 }
+
+
+
 function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike) 
-    cmodel = CacheModel()
-    index_map = MOI.copy_to(cmodel, src)
-    for (j, k) in index_map
-        dest.x_to_index[j] = k.value
+    list_of_indices = MOI.get(src, MOI.ListOfVariableIndices())
+    # index_map = MOI.IndexMap() MOI.copy_to(cmodel, src)
+
+    N = MOI.get(src, MOI.NumberOfVariables())
+    resize!(dest.variable_lbounds, N)
+    fill!(dest.variable_lbounds, -Inf)
+    resize!(dest.variable_ubounds, N)
+    fill!(dest.variable_ubounds, Inf)
+    index_map = MOI.IndexMap()
+    for k in list_of_indices
+        dest.x_to_index[k] = k.value
+        index_map[k] = k
     end
+    dest.silent = false;
     ftype = MOI.get(src, MOI.ObjectiveFunctionType())
     objfunc = MOI.get(src, MOI.ObjectiveFunction{ftype}())
+
+    maxterm = max_coeff(objfunc)
+    qterms = MOI.ScalarQuadraticTerm{Float64}[]
+    for t in list_of_indices
+        qterm_st = MOI.ScalarQuadraticTerm{Float64}(8200.0, t, t)
+        push!(qterms, qterm_st)
+
+    end
+    
     MOI.set(dest.qpblock, MOI.ObjectiveFunction{ftype}(), objfunc)
     for (F, S) in MOI.get(src, MOI.ListOfConstraintTypesPresent())
+        lbound_value = 0.0
+        if S <: MOI.EqualTo{Float64}
+            lbound_value = -Inf 
+        end
         for ci in MOI.get(src, MOI.ListOfConstraintIndices{F, S}())
+            if !(F <: MOI.VariableIndex)
+                push!(dest.variable_lbounds, lbound_value)
+                push!(dest.variable_ubounds, Inf)
+            end
             func = MOI.get(src, MOI.ConstraintFunction(), ci)
-            MOI.add_constraint(dest.qpblock, func, set)
+            set = MOI.get(src, MOI.ConstraintSet(), ci)
+            MOI.add_constraint(dest, func, set)
         end
     end
-    N = MOI.get(src, MOI.NumberOfVariables())
-
-    dest.status, dest.primal_status, dest.dual_status, dest.solve_time, dest.primal, dest.dual = solve_pddyn(dest.qpblock, N, verbose=!dest.silent)
+    normalize(dest.qpblock)
+    dest.status, dest.primal_status, dest.dual_status, dest.solve_time, dest.primal, dest.dual = solve_pddyn(dest.qpblock,
+                                                                                                             N, 
+                                                                                                             dest.variable_lbounds, 
+                                                                                                             dest.variable_ubounds,
+                                                                                                             verbose=!dest.silent,
+                                                                                                             τ=1e-6,
+                                                                                                             tstop=100.,
+                                                                                                             log_freq=1_000_000)
     dest.obj_value = MOI.eval_objective(dest.qpblock, dest.primal)
 
     # dest.dual_status = MOI.DualStatus
@@ -218,22 +270,45 @@ MOI.get(model::Optimizer, ::MOI.TerminationStatus) = model.status
 MOI.supports(::Optimizer, ::MOI.Silent) = true;
 
 
-Q = linalg.I(10)
+# Now for the constraint bridge
+
+
+N = 3
+M = 3
+Q = linalg.I(N)
+Q2 = 0.2*linalg.diagm(1.0:N)
+Q3 = 2*linalg.diagm(1.0:N)
+b = rand(rng, M)
 # Q = Q * Q'
 # print(Q)
-c = rand(10)
-model = Model(Optimizer)
-@variable(model, x[1:10])
-@objective(model, MIN_SENSE, x' * Q * x + c' * x)
-set_silent(model)
+c = rand(rng, N)
+model = Model(Ipopt.Optimizer)
+@variable(model, x[1:N])
+@objective(model, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
+@constraint(model,x' * Q2 * x == 10000)
+@constraint(model, x[1] <= 1)
+@constraint(model, x[1] >= 0.2)
+# @constraint(model, x' * Q3 * x <= 200000)
 optimize!(model)
-println(solution_summary(model))
-model2 = Model(Ipopt.Optimizer)
-@variable(model2, y[1:10])
-@objective(model2, MIN_SENSE, y' * Q * y + c' * y)
-set_silent(model2)
+model2 = Model(Optimizer)
+@variable(model2, x[1:N])
+@objective(model2, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
+@constraint(model2, x' * Q2 * x == 8000)
+# @constraint(model2, x' * Q3 * x <= 200000)
+@constraint(model2, x[1] <= 1)
+@constraint(model2, x[1] >= 0.2)
 optimize!(model2)
-println(solution_summary(model2))
+power_file = ENV["PGLIB"] * "/pglib_opf_case3_lmbd.m"
+pm = instantiate_model(power_file, ACRPowerModel, PowerModels.build_opf)
+optimize_model!(pm, optimizer=Optimizer)
+# optimize_model!(pm,)
+# moi_model = pm.model.moi_backend;
+
+# data = parse_file(ENV["PGLIB"] * "/pglib_opf_case3_lmbd.m")
+# model_1 = solve_ac_opf(data, Ipopt.Optimizer)
+# model_2 = solve_ac_opf(data, Optimizer)
+
+# println(solution_summary(model2))
 # function MOI.optimize!(model::Optimizer)
     
 #     end

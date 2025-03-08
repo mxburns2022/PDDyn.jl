@@ -64,6 +64,8 @@ function get_grad(
     end
     # Now get the objective gradient
     MOI.eval_constraint(problem, ddual, primal);
+    ddual ./= problem.norm_constant
+    dprimal ./= problem.norm_constant
 end
 function get_proximal_primal_grad(
         problem::QPBlockData{Float64},
@@ -96,12 +98,14 @@ end
 
 function solve_pddyn(
     problem::QPBlockData{Float64},
-    n::Int;
-    tstop::Float64 = 50.0,
-    τ::Float64 = 1e-5,
+    n::Int,
+    lbounds::Vector{Float64},
+    ubounds::Vector{Float64};
+    tstop::Float64 = 5000.0,
+    τ::Float64 = 1e-3,
     tol::Float64 = 1e-5,
     verbose::Bool = true,
-    log_freq::Int = 1_000,
+    log_freq::Int = 10_000,
     post_sample::Bool = false,
     target::Union{QPBlockData{Float64}, Type{Nothing}} = Nothing
 )
@@ -123,16 +127,19 @@ function solve_pddyn(
         dx[1:n] .= -dprimal
         dx[n+1:end] .= ddual
     end
+    println()
+    println("$(m)")
     integrator = RK45Integrator(n+m, τ)
     time = 0.0
     x = zeros(n+m)
     k = 0
     status = MOI.OTHER_ERROR
     while status == MOI.OTHER_ERROR && time < tstop
-        
         # Take a single gradient step
         rks_step!(integrator, x, grad, time)
-        x[n+1:end] .= max.(0., x[n+1:end])
+        x.= min.(max.(x, lbounds), ubounds)
+        # x[1:n] .= max.(x[1:n], 0.0)
+        # x[1:n] .= min.(x[1:n], ubounds)
         if time >= tstop
             status = MOI.ITERATION_LIMIT
         end
@@ -141,7 +148,7 @@ function solve_pddyn(
                 testvec = fill(0.0, m);
                 MOI.eval_constraint(problem, testvec, x[1:n])
                 comp = testvec .* x[n+1:end]
-                print(testvec)
+                # print(testvec)
                 logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
                 # println(testvec .* x[n+1:end])
                 println(join(logs, "\t"))
@@ -391,3 +398,26 @@ function main_test()
     optimize!(model)
     # obj3 = MOI.eval_objective(test, res3[3])
 end
+# N = 10
+# M = 8
+# Q = linalg.diagm([1.0 for i in 1:N])
+# Q2 = rand(M, 10)#0.2*linalg.diagm(1.0:N)
+# b = rand(M)
+# # Q = Q * Q'
+# # print(Q)
+# test = QPBlockData{Float64}()
+# c = rand(rng, N)
+# model = Model(Ipopt.Optimizer)
+# @variable(model, x[1:N])
+# @objective(model, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
+# @constraint(model, Q2 * x >= b)
+# optimize!(model)
+# Z = zeros(Float64, N, N)
+# y = MOI.VariableIndex.(1:N)
+# for i in 1:M
+#     f = to_moi(y, Z, -Q2[i,:], b[i])
+#     MOI.add_constraint(test, f, MOI.LessThan(0.0))
+# end
+# fobj = to_moi(y, Q, c, 0.0)
+# MOI.set(test, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}(), fobj)
+# # vals = 

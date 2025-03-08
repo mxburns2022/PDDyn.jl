@@ -29,14 +29,14 @@ end
     _kFunctionTypeScalarQuadratic,
 )
 
-function _function_type_to_func(::Type{T}, k::_FunctionType) where {T}
+function _function_type_to_func(::Type{Float64}, k::_FunctionType)
     if k == _kFunctionTypeVariableIndex
         return MOI.VariableIndex
     elseif k == _kFunctionTypeScalarAffine
-        return MOI.ScalarAffineFunction{T}
+        return MOI.ScalarAffineFunction{Float64}
     else
         @assert k == _kFunctionTypeScalarQuadratic
-        return MOI.ScalarQuadraticFunction{T}
+        return MOI.ScalarQuadraticFunction{Float64}
     end
 end
 
@@ -52,53 +52,74 @@ _function_info(::MOI.ScalarQuadraticFunction) = _kFunctionTypeScalarQuadratic
     _kBoundTypeInterval,
 )
 
-_set_info(s::MOI.LessThan) = _kBoundTypeLessThan, -Inf, s.upper
-_set_info(s::MOI.GreaterThan) = _kBoundTypeGreaterThan, s.lower, Inf
-_set_info(s::MOI.EqualTo) = _kBoundTypeEqualTo, s.value, s.value
-_set_info(s::MOI.Interval) = _kBoundTypeInterval, s.lower, s.upper
+_set_info(s::MOI.LessThan) = _kBoundTypeLessThan, -Inf, s.upper, 1, -s.upper
+_set_info(s::MOI.GreaterThan) = _kBoundTypeGreaterThan, s.lower, Inf, -1, s.lower
+_set_info(s::MOI.EqualTo) = _kBoundTypeEqualTo, s.value, s.value, 1, 1
+_set_info(s::MOI.Interval) = _kBoundTypeInterval, s.lower, s.upper, 1, 1
 
-function _bound_type_to_set(::Type{T}, k::_BoundType) where {T}
+function _bound_type_to_set(::Type{Float64}, k::_BoundType)
     if k == _kBoundTypeEqualTo
-        return MOI.EqualTo{T}
+        return MOI.EqualTo{Float64}
     elseif k == _kBoundTypeLessThan
-        return MOI.LessThan{T}
+        return MOI.LessThan{Float64}
     elseif k == _kBoundTypeGreaterThan
-        return MOI.GreaterThan{T}
+        return MOI.GreaterThan{Float64}
     else
         @assert k == _kBoundTypeInterval
-        return MOI.Interval{T}
+        return MOI.Interval{Float64}
     end
 end
 
-mutable struct QPBlockData{T}
-    objective::Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}}
+function max_coeff(f::MOI.ScalarAffineFunction{Float64})
+    maxfound = abs(f.constant)
+    for t in f.terms
+        maxfound = max(maxfound, abs(t.coefficient))
+    end
+    return maxfound
+end
+
+function max_coeff(f::MOI.ScalarQuadraticFunction{Float64})
+    maxfound = abs(f.constant)
+    for t in f.affine_terms
+        maxfound = max(maxfound, abs(t.coefficient))
+    end
+    for t in f.quadratic_terms
+        maxfound = max(maxfound, abs(t.coefficient))
+    end
+    return maxfound
+end
+
+mutable struct QPBlockData{Float64}
+    objective::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}}
     objective_function_type::_FunctionType
     constraints::Vector{
-        Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}},
+        Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
     }
-    g_L::Vector{T}
-    g_U::Vector{T}
-    mult_g::Vector{Union{Nothing,T}}
+    g_L::Vector{Float64}
+    g_U::Vector{Float64}
+    mult_g::Vector{Union{Nothing,Float64}}
     function_type::Vector{_FunctionType}
     bound_type::Vector{_BoundType}
-    parameters::Dict{Int64,T}
+    parameters::Dict{Int64,Float64}
+    norm_constant::Float64
 
-    function QPBlockData{T}() where {T}
+    function QPBlockData{Float64}()
         return new(
-            zero(MOI.ScalarQuadraticFunction{T}),
+            zero(MOI.ScalarQuadraticFunction{Float64}),
             _kFunctionTypeScalarAffine,
-            Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}}[],
-            T[],
-            T[],
-            Union{Nothing,T}[],
+            Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}}[],
+            Float64[],
+            Float64[],
+            Union{Nothing,Float64}[],
             _FunctionType[],
             _BoundType[],
-            Dict{Int64,T}(),
+            Dict{Int64,Float64}(),
+            1.
         )
     end
 end
 
-function MOI.empty!(block::QPBlockData{T}) where {T}
+function MOI.empty!(block::QPBlockData{Float64})
     empty!(block.constraints)
     empty!(block.g_L)
     empty!(block.g_U)
@@ -108,7 +129,7 @@ function MOI.empty!(block::QPBlockData{T}) where {T}
     empty!(block.parameters)
 end
 
-function MOI.is_empty(block::QPBlockData{T}) where {T}
+function MOI.is_empty(block::QPBlockData{Float64})
     return size(block.constraints)[1] == 0
 end
 
@@ -121,10 +142,10 @@ function _value(variable::MOI.VariableIndex, x::Vector, p::Dict)
 end
 
 function eval_function(
-    f::MOI.ScalarQuadraticFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::T where {T}
+    f::MOI.ScalarQuadraticFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Float64
     y = f.constant
     for term in f.affine_terms
         y += term.coefficient * _value(term.variable, x, p)
@@ -142,10 +163,10 @@ function eval_function(
 end
 
 function eval_function(
-    f::MOI.ScalarAffineFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::T where {T}
+    f::MOI.ScalarAffineFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Float64
     y = f.constant
     for term in f.terms
         y += term.coefficient * _value(term.variable, x, p)
@@ -154,11 +175,11 @@ function eval_function(
 end
 
 function eval_dense_gradient(
-    ∇f::Vector{T},
-    f::MOI.ScalarQuadraticFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::Nothing where {T}
+    ∇f::Vector{Float64},
+    f::MOI.ScalarQuadraticFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Nothing
     for term in f.affine_terms
         if !_is_parameter(term.variable)
             ∇f[term.variable.value] += term.coefficient
@@ -177,12 +198,19 @@ function eval_dense_gradient(
     return
 end
 
+function normalize(block::QPBlockData) 
+    block.norm_constant = max_coeff(block.objective)
+    for c in block.constraints
+        block.norm_constant = max(block.norm_constant, max_coeff(c))
+    end
+end
+
 function eval_dense_gradient(
-    ∇f::Vector{T},
-    f::MOI.ScalarAffineFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::Nothing where {T}
+    ∇f::Vector{Float64},
+    f::MOI.ScalarAffineFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Nothing
     for term in f.terms
         if !_is_parameter(term.variable)
             ∇f[term.variable.value] += term.coefficient
@@ -222,11 +250,11 @@ function append_sparse_gradient_structure!(f::MOI.ScalarAffineFunction, J, row)
 end
 
 function  eval_sparse_gradient(
-    ∇f::AbstractVector{T},
-    f::MOI.ScalarQuadraticFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::Int where {T}
+    ∇f::AbstractVector{Float64},
+    f::MOI.ScalarQuadraticFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Int
     i = 0
     for term in f.affine_terms
         if !_is_parameter(term.variable)
@@ -250,11 +278,11 @@ function  eval_sparse_gradient(
 end
 
 function eval_sparse_gradient(
-    ∇f::AbstractVector{T},
-    f::MOI.ScalarAffineFunction{T},
-    x::Vector{T},
-    p::Dict{Int64,T},
-)::Int where {T}
+    ∇f::AbstractVector{Float64},
+    f::MOI.ScalarAffineFunction{Float64},
+    x::Vector{Float64},
+    p::Dict{Int64,Float64},
+)::Int
     i = 0
     for term in f.terms
         if !_is_parameter(term.variable)
@@ -278,10 +306,10 @@ end
 append_sparse_hessian_structure!(::MOI.ScalarAffineFunction, H) = nothing
 
 function eval_sparse_hessian(
-    ∇²f::AbstractVector{T},
-    f::MOI.ScalarQuadraticFunction{T},
-    σ::T,
-)::Int where {T}
+    ∇²f::AbstractVector{Float64},
+    f::MOI.ScalarQuadraticFunction{Float64},
+    σ::Float64,
+)::Int
     i = 0
     for term in f.quadratic_terms
         if _is_parameter(term.variable_1) || _is_parameter(term.variable_2)
@@ -294,80 +322,80 @@ function eval_sparse_hessian(
 end
 
 function eval_sparse_hessian(
-    ∇²f::AbstractVector{T},
-    f::MOI.ScalarAffineFunction{T},
-    σ::T,
-)::Int where {T}
+    ∇²f::AbstractVector{Float64},
+    f::MOI.ScalarAffineFunction{Float64},
+    σ::Float64,
+)::Int
     return 0
 end
 
 Base.length(block::QPBlockData) = length(block.bound_type)
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ObjectiveFunction{F},
     f::F,
-) where {T,F<:Union{MOI.VariableIndex,MOI.ScalarAffineFunction{T}}}
-    block.objective = convert(MOI.ScalarAffineFunction{T}, f)
+) where {Float64,F<:Union{MOI.VariableIndex,MOI.ScalarAffineFunction{Float64}}}
+    block.objective = convert(MOI.ScalarAffineFunction{Float64}, f)
     block.objective_function_type = _function_info(f)
     return
 end
 
 function MOI.set(
-    block::QPBlockData{T},
-    ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{T}},
-    f::MOI.ScalarQuadraticFunction{T},
-) where {T}
+    block::QPBlockData{Float64},
+    ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}},
+    f::MOI.ScalarQuadraticFunction{Float64},
+)
     block.objective = f
     block.objective_function_type = _function_info(f)
     return
 end
 
-function MOI.get(block::QPBlockData{T}, ::MOI.ObjectiveFunctionType) where {T}
-    return _function_type_to_func(T, block.objective_function_type)
+function MOI.get(block::QPBlockData{Float64}, ::MOI.ObjectiveFunctionType)
+    return _function_type_to_func(Float64, block.objective_function_type)
 end
 
-function MOI.get(block::QPBlockData{T}, ::MOI.ObjectiveFunction{F}) where {T,F}
+function MOI.get(block::QPBlockData{Float64}, ::MOI.ObjectiveFunction{F}) where {Float64,F}
     return convert(F, block.objective)
 end
 
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ListOfConstraintTypesPresent,
-) where {T}
+)
     constraints = Set{Tuple{Type,Type}}()
     for i in 1:length(block)
-        F = _function_type_to_func(T, block.function_type[i])
-        S = _bound_type_to_set(T, block.bound_type[i])
+        F = _function_type_to_func(Float64, block.function_type[i])
+        S = _bound_type_to_set(Float64, block.bound_type[i])
         push!(constraints, (F, S))
     end
     return collect(constraints)
 end
 
 function MOI.is_valid(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ci::MOI.ConstraintIndex{F,S},
 ) where {
-    T,
-    F<:Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}},
-    S<:Union{MOI.LessThan{T},MOI.GreaterThan{T},MOI.EqualTo{T},MOI.Interval{T}},
+    Float64,
+    F<:Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    S<:Union{MOI.LessThan{Float64},MOI.GreaterThan{Float64},MOI.EqualTo{Float64},MOI.Interval{Float64}},
 }
     return 1 <= ci.value <= length(block)
 end
 
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ListOfConstraintIndices{F,S},
 ) where {
-    T,
-    F<:Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}},
-    S<:Union{MOI.LessThan{T},MOI.GreaterThan{T},MOI.EqualTo{T},MOI.Interval{T}},
+    Float64,
+    F<:Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    S<:Union{MOI.LessThan{Float64},MOI.GreaterThan{Float64},MOI.EqualTo{Float64},MOI.Interval{Float64}},
 }
     ret = MOI.ConstraintIndex{F,S}[]
     for i in 1:length(block)
-        if _bound_type_to_set(T, block.bound_type[i]) != S
+        if _bound_type_to_set(Float64, block.bound_type[i]) != S
             continue
-        elseif _function_type_to_func(T, block.function_type[i]) != F
+        elseif _function_type_to_func(Float64, block.function_type[i]) != F
             continue
         end
         push!(ret, MOI.ConstraintIndex{F,S}(i))
@@ -376,44 +404,76 @@ function MOI.get(
 end
 
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.NumberOfConstraints{F,S},
 ) where {
-    T,
-    F<:Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}},
-    S<:Union{MOI.LessThan{T},MOI.GreaterThan{T},MOI.EqualTo{T},MOI.Interval{T}},
+    Float64,
+    F<:Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    S<:Union{MOI.LessThan{Float64},MOI.GreaterThan{Float64},MOI.EqualTo{Float64},MOI.Interval{Float64}},
 }
     return length(MOI.get(block, MOI.ListOfConstraintIndices{F,S}()))
 end
 
 function MOI.add_constraint(
-    block::QPBlockData{T},
-    f::Union{MOI.ScalarAffineFunction{T},MOI.ScalarQuadraticFunction{T}},
-    s::Union{MOI.LessThan{T},MOI.GreaterThan{T},MOI.EqualTo{T},MOI.Interval{T}},
-) where {T}
-    push!(block.constraints, f)
-    bound_type, l, u = _set_info(s)
-    push!(block.g_L, l)
-    push!(block.g_U, u)
+    block::QPBlockData{Float64},
+    f::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    s::MOI.EqualTo{Float64},
+)
+    g = f - s.value
+    push!(block.constraints, g)
+    push!(block.g_L, s.value)
+    push!(block.g_U, s.value)
     push!(block.mult_g, nothing)
-    push!(block.bound_type, bound_type)
+    push!(block.bound_type, _kBoundTypeLessThan)
     push!(block.function_type, _function_info(f))
     return MOI.ConstraintIndex{typeof(f),typeof(s)}(length(block.bound_type))
 end
 
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    f::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    s::MOI.LessThan{Float64}
+)
+    g = f - s.upper
+    push!(block.constraints, g)
+    push!(block.g_L, -Inf)
+    push!(block.g_U, s.upper)
+    push!(block.mult_g, nothing)
+    push!(block.bound_type, _kBoundTypeLessThan)
+    push!(block.function_type, _function_info(f))
+    return MOI.ConstraintIndex{typeof(f),MOI.LessThan{Float64}}(length(block.bound_type))
+end
+
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    f::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    s::MOI.GreaterThan{Float64},
+)
+    
+    g = -f + s.lower
+    push!(block.constraints, g)
+    push!(block.g_L,s.lower)
+    push!(block.g_U, Inf)
+    push!(block.mult_g, nothing)
+    push!(block.bound_type, _kBoundTypeLessThan)
+    push!(block.function_type, _function_info(f))
+    return MOI.ConstraintIndex{typeof(f),MOI.LessThan{Float64}}(length(block.bound_type))
+end
+
+
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintFunction,
     c::MOI.ConstraintIndex{F,S},
-) where {T,F,S}
+) where {Float64,F,S}
     return convert(F, block.constraints[c.value])
 end
 
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintSet,
     c::MOI.ConstraintIndex{F,S},
-) where {T,F,S}
+) where {Float64,F,S}
     row = c.value
     if block.bound_type[row] == _kBoundTypeEqualTo
         return MOI.EqualTo(block.g_L[row])
@@ -428,33 +488,33 @@ function MOI.get(
 end
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintSet,
-    c::MOI.ConstraintIndex{F,MOI.LessThan{T}},
-    set::MOI.LessThan{T},
-) where {T,F}
+    c::MOI.ConstraintIndex{F,MOI.LessThan{Float64}},
+    set::MOI.LessThan{Float64},
+) where {Float64,F}
     row = c.value
     block.g_U[row] = set.upper
     return
 end
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintSet,
-    c::MOI.ConstraintIndex{F,MOI.GreaterThan{T}},
-    set::MOI.GreaterThan{T},
-) where {T,F}
+    c::MOI.ConstraintIndex{F,MOI.GreaterThan{Float64}},
+    set::MOI.GreaterThan{Float64},
+) where {Float64,F}
     row = c.value
     block.g_L[row] = set.lower
     return
 end
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintSet,
-    c::MOI.ConstraintIndex{F,MOI.EqualTo{T}},
-    set::MOI.EqualTo{T},
-) where {T,F}
+    c::MOI.ConstraintIndex{F,MOI.EqualTo{Float64}},
+    set::MOI.EqualTo{Float64},
+) where {Float64,F}
     row = c.value
     block.g_L[row] = set.value
     block.g_U[row] = set.value
@@ -462,11 +522,11 @@ function MOI.set(
 end
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintSet,
-    c::MOI.ConstraintIndex{F,MOI.Interval{T}},
-    set::MOI.Interval{T},
-) where {T,F}
+    c::MOI.ConstraintIndex{F,MOI.Interval{Float64}},
+    set::MOI.Interval{Float64},
+) where {Float64,F}
     row = c.value
     block.g_L[row] = set.lower
     block.g_U[row] = set.upper
@@ -474,45 +534,45 @@ function MOI.set(
 end
 
 function MOI.get(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintDualStart,
     c::MOI.ConstraintIndex{F,S},
-) where {T,F,S}
+) where {Float64,F,S}
     return block.mult_g[c.value]
 end
 
 function MOI.set(
-    block::QPBlockData{T},
+    block::QPBlockData{Float64},
     ::MOI.ConstraintDualStart,
     c::MOI.ConstraintIndex{F,S},
     value,
-) where {T,F,S}
+) where {Float64,F,S}
     block.mult_g[c.value] = value
     return
 end
 
 function MOI.eval_objective(
-    block::QPBlockData{T},
-    x::AbstractVector{T},
-) where {T}
+    block::QPBlockData{Float64},
+    x::AbstractVector{Float64},
+)
     return eval_function(block.objective, x, block.parameters)
 end
 
 function MOI.eval_objective_gradient(
-    block::QPBlockData{T},
-    ∇f::AbstractVector{T},
-    x::AbstractVector{T},
-) where {T}
-    ∇f .= zero(T)
+    block::QPBlockData{Float64},
+    ∇f::AbstractVector{Float64},
+    x::AbstractVector{Float64},
+)
+    ∇f .= zero(Float64)
     eval_dense_gradient(∇f, block.objective, x, block.parameters)
     return
 end
 
 function MOI.eval_constraint(
-    block::QPBlockData{T},
-    g::AbstractVector{T},
-    x::AbstractVector{T},
-) where {T}
+    block::QPBlockData{Float64},
+    g::AbstractVector{Float64},
+    x::AbstractVector{Float64},
+)
     for (i, constraint) in enumerate(block.constraints)
         g[i] = eval_function(constraint, x, block.parameters)
     end
@@ -528,10 +588,10 @@ function MOI.jacobian_structure(block::QPBlockData)
 end
 
 function MOI.eval_constraint_jacobian(
-    block::QPBlockData{T},
-    J::AbstractVector{T},
-    x::AbstractVector{T},
-) where {T}
+    block::QPBlockData{Float64},
+    J::AbstractVector{Float64},
+    x::AbstractVector{Float64},
+)
     i = 1
     for constraint in block.constraints
         ∇f = view(J, i:length(J))
@@ -550,12 +610,12 @@ function MOI.hessian_lagrangian_structure(block::QPBlockData)
 end
 
 function MOI.eval_hessian_lagrangian(
-    block::QPBlockData{T},
-    H::AbstractVector{T},
-    x::AbstractVector{T},
-    σ::T,
-    μ::AbstractVector{T},
-) where {T}
+    block::QPBlockData{Float64},
+    H::AbstractVector{Float64},
+    x::AbstractVector{Float64},
+    σ::Float64,
+    μ::AbstractVector{Float64},
+)
     i = 1
     i += eval_sparse_hessian(H, block.objective, σ)
     for (row, constraint) in enumerate(block.constraints)
