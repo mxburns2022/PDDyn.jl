@@ -64,8 +64,8 @@ function get_grad(
     end
     # Now get the objective gradient
     MOI.eval_constraint(problem, ddual, primal);
-    ddual ./= problem.norm_constant
-    dprimal ./= problem.norm_constant
+    # ddual ./= problem.norm_constant
+    # dprimal ./= problem.norm_constant
 end
 function get_proximal_primal_grad(
         problem::QPBlockData{Float64},
@@ -126,12 +126,13 @@ function solve_pddyn(
         get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end])
         dx[1:n] .= -dprimal
         dx[n+1:end] .= ddual
+        x.= min.(max.(x, lbounds), ubounds)
     end
     println()
     println("$(m)")
     integrator = RK45Integrator(n+m, τ)
     time = 0.0
-    x = zeros(n+m)
+    x = rand(n+m)
     k = 0
     status = MOI.OTHER_ERROR
     while status == MOI.OTHER_ERROR && time < tstop
@@ -170,7 +171,7 @@ function solve_pddyn(
         copy!(bestx, x)
         for i in 1:n_iter
             grad(grad_buff, x, time)
-            grad_buff[1:n] .+= 1 / 256 *( sqrt( 1 / 1e-4)) * randn(n)
+            grad_buff[1:n] .+= 1 / 256 * (sqrt( 1 / 1e-4)) * randn(n)
             x += 1e-4 * grad_buff;
             x[n+1:end] .= max.(0., x[n+1:end])
             if time >= tstop

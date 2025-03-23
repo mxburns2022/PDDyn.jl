@@ -4,7 +4,6 @@ import LinearAlgebra as linalg
 import MathOptInterface.Utilities as MOIU
 
 using Random
-rng = MersenneTwister(123)
 
 
 
@@ -209,6 +208,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
         dest.x_to_index[k] = k.value
         index_map[k] = k
     end
+    println("N", N)
     dest.silent = false;
     ftype = MOI.get(src, MOI.ObjectiveFunctionType())
     objfunc = MOI.get(src, MOI.ObjectiveFunction{ftype}())
@@ -216,11 +216,16 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     maxterm = max_coeff(objfunc)
     qterms = MOI.ScalarQuadraticTerm{Float64}[]
     for t in list_of_indices
-        qterm_st = MOI.ScalarQuadraticTerm{Float64}(8200.0, t, t)
+        qterm_st = MOI.ScalarQuadraticTerm{Float64}(2, t, t)
         push!(qterms, qterm_st)
 
     end
-    
+    dummylin = MOI.ScalarAffineTerm(0.0, list_of_indices[1])
+    objfunc_type = typeof(objfunc)
+    # if objfunc_type == MOI.ScalarAffineFunction{Float64}
+        
+    # end
+    # objfunc = objfunc + MOI.ScalarQuadraticFunction(qterms[3:3], [dummylin], 0.0)
     MOI.set(dest.qpblock, MOI.ObjectiveFunction{ftype}(), objfunc)
     for (F, S) in MOI.get(src, MOI.ListOfConstraintTypesPresent())
         lbound_value = 0.0
@@ -232,29 +237,24 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                 push!(dest.variable_lbounds, lbound_value)
                 push!(dest.variable_ubounds, Inf)
             end
+            # println()
             func = MOI.get(src, MOI.ConstraintFunction(), ci)
             set = MOI.get(src, MOI.ConstraintSet(), ci)
             MOI.add_constraint(dest, func, set)
         end
     end
-    normalize(dest.qpblock)
+
+
+    # normalize(dest.qpblock)
     dest.status, dest.primal_status, dest.dual_status, dest.solve_time, dest.primal, dest.dual = solve_pddyn(dest.qpblock,
                                                                                                              N, 
                                                                                                              dest.variable_lbounds, 
                                                                                                              dest.variable_ubounds,
                                                                                                              verbose=!dest.silent,
-                                                                                                             τ=1e-6,
-                                                                                                             tstop=100.,
-                                                                                                             log_freq=1_000_000)
+                                                                                                             τ=1e-8,
+                                                                                                             tstop=100000.,
+                                                                                                             log_freq=500_000)
     dest.obj_value = MOI.eval_objective(dest.qpblock, dest.primal)
-
-    # dest.dual_status = MOI.DualStatus
-    # for src_ci in MOI.get(src, MOI.ListOfConstraintIndices{F, S}())
-    #     dest.ci_to_rows[index_map[src_ci]] = MOI.Utilities.rows(cache.constraints.sets, index_map[src_ci])
-    # end
-    # for (i, src_x) in enumerate(MOI.get(src, MOI.ListOfVariableIndices()))
-    #     dest.x_to_col[index_map[src_x]] = i
-    # end
     return index_map, false
 end
 
@@ -269,38 +269,131 @@ MOI.get(model::Optimizer, ::MOI.TerminationStatus) = model.status
 
 MOI.supports(::Optimizer, ::MOI.Silent) = true;
 
-
+function construct_admittance_matrix() 
+    
+end
 # Now for the constraint bridge
 
+if false
+    rng = MersenneTwister(3)
+    N = 10
+    M = 6
+    Q = linalg.I(N)
+    Q2 = 0.2*linalg.diagm(1.0:N)
+    Q3 = 2*linalg.diagm(1.0:N)
+    b = rand(rng, M) * 10
+    A = rand(rng, M, N)
+    # Q = Q * Q'
+    # print(Q)
+    c = rand(rng, N)
+    model = Model(Ipopt.Optimizer)
+    @variable(model, x[1:N])
+    @objective(model, MIN_SENSE, c' * x+  2 * x' * I * x)
+    # @constraint(model, A * x <= b)
+    # @constraint(model, x>=0)
 
-N = 3
-M = 3
-Q = linalg.I(N)
-Q2 = 0.2*linalg.diagm(1.0:N)
-Q3 = 2*linalg.diagm(1.0:N)
-b = rand(rng, M)
-# Q = Q * Q'
-# print(Q)
-c = rand(rng, N)
-model = Model(Ipopt.Optimizer)
-@variable(model, x[1:N])
-@objective(model, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
-@constraint(model,x' * Q2 * x == 10000)
-@constraint(model, x[1] <= 1)
-@constraint(model, x[1] >= 0.2)
-# @constraint(model, x' * Q3 * x <= 200000)
-optimize!(model)
-model2 = Model(Optimizer)
-@variable(model2, x[1:N])
-@objective(model2, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
-@constraint(model2, x' * Q2 * x == 8000)
-# @constraint(model2, x' * Q3 * x <= 200000)
-@constraint(model2, x[1] <= 1)
-@constraint(model2, x[1] >= 0.2)
-optimize!(model2)
-power_file = ENV["PGLIB"] * "/pglib_opf_case3_lmbd.m"
-pm = instantiate_model(power_file, ACRPowerModel, PowerModels.build_opf)
-optimize_model!(pm, optimizer=Optimizer)
+    # @constraint(model, x[1] <= 1)
+    # @constraint(model, x[1] >= 0.2)
+    @constraint(model, 2 <= x' * Q3 * x <=20)
+    optimize!(model)
+    println(model)
+    model2 = Model(Optimizer)
+    @variable(model2, x[1:N])
+    @objective(model2, MIN_SENSE,  c' * x + 2 * x' * I * x)
+    # @constraint(model2, A * x <= b)
+
+    @constraint(model2, 2 <= x' * Q3 * x <=20)
+    # @constraint(model2, x>=0)
+    optimize!(model2)
+elseif true
+    power_file = ENV["PGLIB"] * "/pglib_opf_case3_lmbd.m";
+    pm = instantiate_model(power_file, IVRPowerModel, PowerModels.build_opf);
+    model = pm.model.moi_backend
+    # for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
+    #     if S <: MOI.EqualTo{Float64}
+    #         for cind in MOI.get(model, MOI.ListOfConstraintIndices{F,S}())
+    #             MOI.delete(model, cind)
+    #         end
+    #     end
+
+    # end
+    # optimize_model!(pm, optimizer=Optimizer)
+    # optimize_model!(pm, optimizer=Ipopt.Optimizer)
+else
+    Y = hcat(
+        [0, 1 / (0.042 + 0.9im), 1 / (0.065 + 0.62im)],
+        [ 1 / (0.042 + 0.9im), 0, 1 / (0.025 + 0.75im)],
+        [1 / (0.042 + 0.9im), 1 / (0.025 + 0.75im),0],
+    )
+    b =  hcat(
+        [0, 0.3, 0.45],
+        [ 0, 0, 0.7],
+        [0, 0,0],
+    )
+    G = real(Y)
+    B = imag(Y)
+    Y[1, 1] += 1 / (.45im)
+    Y[3, 3] += 1 / (.45im)
+
+    model = Model(Ipopt.Optimizer)
+    # @variable(model, p_g[1:3])
+    # @variable(model, q_g[1:3])
+    @variable(model, vd[1:3])
+    @variable(model, vq[1:3])
+    # @variable(model, p_12)
+    # @variable(model, p_21)
+    # @variable(model, p_13)
+    # @variable(model, p_31)
+    # @variable(model, p_23)
+    # @variable(model, p_32)
+    # @variable(model, q_12)
+    # @variable(model, q_21)
+    # @variable(model, q_13)
+    # @variable(model, q_31)
+    # @variable(model, q_23)
+    # @variable(model, q_32)
+    @objective(model, MIN_SENSE, 1100 * vd[1]^2*vq[1]^2 + 500 * vd[1]*vq[1] + 850 * p_g[2]^2 + 120 * p_g[2])
+
+    @constraint(model,0 <= p_g[1] <= 20)
+    @constraint(model,0 <= p_g[2] <= 20)
+    @constraint(model,0 <= p_g[3] <= 0)
+    @constraint(model,-10 <= q_g[1] <= 10)
+    @constraint(model,-10 <= q_g[2] <= 10)
+    @constraint(model,-10 <= q_g[3] <= 10)
+    @constraint(model,0.9^2 <= vd[1]^2 + vq[1]^2 <= 1.1^2)
+    @constraint(model,0.9^2 <= vd[2]^2 + vq[2]^2 <= 1.1^2)
+    @constraint(model,0.9^2 <= vd[3]^2 + vq[3]^2 <= 1.1^2)
+
+    @constraint(model,p_12^2 + q_12^2 <= 8100)
+    @constraint(model,p_21^2 + q_21^2 <= 8100)
+
+    @constraint(model,p_13^2 + q_13^2 <= 8100)
+    @constraint(model,p_31^2 + q_31^2 <= 8100)
+
+    @constraint(model,p_23^2 + q_23^2 <= 0.25)
+    @constraint(model,p_32^2 + q_32^2 <= 0.25)
+    @constraint(model,-1.1 <= vd[1] <= 1.1)
+    @constraint(model,-1.1 <= vd[2] <= 1.1)
+    @constraint(model,-1.1 <= vd[3] <= 1.1)
+    @constraint(model,-1.1 <= vq[1] <= 1.1)
+    @constraint(model,-1.1 <= vq[2] <= 1.1)
+    @constraint(model,-1.1 <= vq[3] <= 1.1)
+    @constraint(model,p_12 + p_13 + p_g[1]-1.10 == -vd[1] * (
+        vd[2] * G[1,2] - vq[2] * B[1,2]+vd[3] * G[1,3] - vq[3] * B[1,3]))
+    @constraint(model,p_g[2]-110 == -vd[2] * (
+        vd[1] * G[2,1] - vq[1] * B[2,1]+vd[3] * G[2,3] - vq[3] * B[2,3]))
+    @constraint(model,p_g[1]-95 == -vd[2] * (
+        vd[1] * G[2,1] - vq[1] * B[2,1]+vd[3] * G[2,3] - vq[3] * B[2,3]))
+    print(model)
+    # @constraint(model,p_g[1]-110 == vd[1] * (1/))
+
+    # pm = instantiate_model(power_file, ACRPowerModel, PowerModels.build_opf)
+    # model = pm.model.moi_backend
+    # println(pm.model)
+
+    # optimize_model!(pm, optimizer=Optimizer)
+    # optimize_model!(pm, optimizer=Ipopt.Optimizer)
+end
 # optimize_model!(pm,)
 # moi_model = pm.model.moi_backend;
 
