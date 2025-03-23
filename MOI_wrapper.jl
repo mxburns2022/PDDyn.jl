@@ -2,7 +2,7 @@ include("PDDyn.jl")
 using PowerModels
 import LinearAlgebra as linalg
 import MathOptInterface.Utilities as MOIU
-
+import SparseArrays as sp
 using Random
 
 
@@ -306,8 +306,49 @@ if false
     # @constraint(model2, x>=0)
     optimize!(model2)
 elseif true
-    power_file = ENV["PGLIB"] * "/pglib_opf_case3_lmbd.m";
-    pm = instantiate_model(power_file, IVRPowerModel, PowerModels.build_opf);
+    function to_real_rep(mat)
+        N = size(mat)[1]
+        real_rep = sp.spzeros(2*N, 2*N)
+        G = real.(mat)
+        B = imag.(mat)
+        copyto!(real_rep, CartesianIndices((1:N, 1:N)), G, CartesianIndices((1:N, 1:N)))
+        copyto!(real_rep, CartesianIndices((1:N, N+1:2N)), -B, CartesianIndices((1:N, 1:N)))
+        copyto!(real_rep, CartesianIndices((N+1:2N, 1:N)), B, CartesianIndices((1:N, 1:N)))
+        copyto!(real_rep, CartesianIndices((N+1:2N, N+1:2N)), G, CartesianIndices((1:N, 1:N)))
+        return real_rep
+    end
+    power_file = ENV["PGLIB"] * "/pglib_opf_case2_lmbd.m";
+    data = parse_file(power_file)
+    Y = calc_admittance_matrix(data).matrix
+    YR = to_real_rep(Y)
+    YI = to_real_rep(-1im * Y)
+    # permute = 
+    N = size(Y)[1]
+    G = real.(Y)
+    B = imag.(Y)
+
+    n = Y.m;
+    C = zeros(4,4)
+    C[1,1] = data["gen"]["1"]["cost"][2]
+    C[3,3] = data["gen"]["1"]["cost"][2]
+    C[2,2] = data["gen"]["2"]["cost"][2]
+    C[4,4] = data["gen"]["2"]["cost"][2]
+    PU = data["gen"]["1"]
+    test_model = Model(Ipopt.Optimizer)
+    @variable(test_model, U[1:2N])
+    @objective(test_model, MIN_SENSE, U' * C * U)
+    # eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);
+    for j in 1:N
+        eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep(Eⱼ * Y);Φⱼ = to_real_rep(-im * Eⱼ * Y);
+        @constraint(test_model, data["gen"]["$(j)"]["pmin"]-data["load"]["$(j)"]["pd"] <= U' * Ψⱼ * U <= data["gen"]["$(j)"]["pmax"]-data["load"]["$(j)"]["pd"])
+        @constraint(test_model, data["gen"]["$(j)"]["qmin"]+data["load"]["$(j)"]["qd"]  <= U' * Φⱼ * U <= data["gen"]["$(j)"]["qmax"]+data["load"]["$(j)"]["qd"])
+        @constraint(test_model, 0.80 <= U[j]^2 + U[j+N]^2 <= 1.23)
+    end
+    # @constraint(test_model, U <= 1.1 * ones(2N))
+    # @constraint(test_model, U >= 0.9 * ones(2N))
+
+    # @constraint(test_model, )
+    pm = instantiate_model(power_file, ACRPowerModel, PowerModels.build_opf);
     model = pm.model.moi_backend
     # for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
     #     if S <: MOI.EqualTo{Float64}
