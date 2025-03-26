@@ -128,8 +128,6 @@ function solve_pddyn(
         dx[n+1:end] .= ddual
         x.= min.(max.(x, lbounds), ubounds)
     end
-    println()
-    println("$(m)")
     integrator = RK45Integrator(n+m, τ)
     time = 0.0
     x = rand(n+m)
