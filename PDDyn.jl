@@ -1,10 +1,11 @@
 import MathOptInterface as MOI
-import SparseArrays as Sp
+import SparseArrays as sp
 import Printf
 using JuMP
 using Ipopt
 using LinearAlgebra
 using Random
+using PowerModels
 rng = MersenneTwister(123)
 
 include("utilities.jl")
@@ -218,96 +219,12 @@ function solve_pddyn(
 end
 
 
-function solve_pddyn_block(
-    problem::QPBlockData{Float64},
-    n::Int,
-    blocks::Int,
-    tol::Float64 = 1e-8,
-    verbose::Bool = true,
-    log_freq::Int = 1_000,
-    τ::Float64 = 1e-1,
-    epoch::Float64 = 1e-3,
-    tstop::Float64 = 50.0
-)
-    bsize = convert(Int, floor(n/blocks));
-    rem = n % blocks;
-    sizes = vcat([bsize + 1 for i in 1:rem], [bsize  for i in rem+1:blocks])
-    sizes = cumsum(sizes)
-    n_partitions = vcat([1:sizes[1]], [sizes[i]:sizes[i+1] for i in 1:length(sizes)-1])
-    printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
-    printf(x::Int) = Printf.@sprintf("%6d", x)
-    # Implement primal-dual dynamics using the differential equation solver
-    m = size(problem.constraints)[1]
-    bsize = convert(Int, floor(m/blocks));
-    rem = m % blocks;
-    sizes = vcat([bsize + 1 for i in 1:rem], [bsize  for i in rem+1:blocks])
-    if m < blocks 
-        sizes = [bsize + 1 for i in 1:rem]
-    end
-    sizes = cumsum(sizes)
-    m_partitions = vcat([n+1:n+sizes[1]+1], [n+sizes[i]:n+sizes[i+1] for i in 1:length(sizes)-1])
-    # n = problem.parameters
-    Jstructure = MOI.jacobian_structure(problem)
-    J = zeros(size(Jstructure));
-    # copyto!(primal_dual_system, dual_dual_inds, -P, CartesianIndices(P))
-    # copyto!(primal_dual_system, primal_dual_inds, A', CartesianIndices(A'))
-    # Projected gradient descent on Lagrangian
-    #       L(x, \lambda) = 
-    function grad(dx, x, t)
-        dprimal = zeros(n)
-        ddual = zeros(m)
-        get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end])
-        dx[1:n] .= -dprimal
-        dx[n+1:end] .= ddual
-    end
-    integrator = RK45Integrator(n+m, τ)
-    time = 0.0
-    x = zeros(n+m)
-    n_scratch = zeros(n)
-    m_scratch = zeros(m)
-    k = 0
-    status = MOI.OTHER_ERROR
-    currblock_n = 1
-    currblock_m = 1
-    println(n, " ", m, " ",sizes, " ",n+m)
-    println(n_partitions)
-    println(m_partitions, m, n+m)
-    # return
-    while status == MOI.OTHER_ERROR && time < tstop
-        τblock = 0.0
-
-        while τblock < epoch
-            rks_step!(integrator, x, grad, time + τblock, [n_partitions[currblock_n], m_partitions[currblock_m]])
-            x[n+1:end] .= max.(0., x[n+1:end])
-            τblock += τ
-        end
-        currblock_n = abs(rand(rng,Int)) % length(n_partitions) + 1
-        currblock_m = abs(rand(rng,Int)) % length(m_partitions) + 1
-        # Take a single gradient step
-        # rks_step!(integrator, x, grad, time)
-        # x[n+1:end] .= max.(0., x[n+1:end])
-        if time >= tstop
-            status = MOI.ITERATION_LIMIT
-        end
-        if verbose && (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
-            testvec = fill(0.0, m);
-            MOI.eval_constraint(problem, testvec, x[1:n])
-            comp = testvec .* x[n+1:end]
-            logs = printf.((time, MOI.eval_objective(problem, x[1:n]), x[n+1], norm(comp)))
-            # println(testvec .* x[n+1:end])
-            println(join(logs, "\t"))
-        end
-        time +=  epoch
-        k += 1
-    end
-    return status, time, x[1:n], x[n+1:m+n], MOI.eval_objective(problem, x[1:n])
-end
 function main_test()
     N = 50
     y = MOI.VariableIndex.(1:N)
 
     c_obj = rand(rng,N)
-    # Q_obj = Sp.spdiagm(N, N, ones(N))
+    # Q_obj = sp.spdiagm(N, N, ones(N))
     Q_obj = diagm(N, N, ones(N))
     maxcoeff = max(maximum(abs.(c_obj)), maximum(abs.(Q_obj)))
     QList = []
@@ -397,26 +314,219 @@ function main_test()
     optimize!(model)
     # obj3 = MOI.eval_objective(test, res3[3])
 end
-# N = 10
-# M = 8
-# Q = linalg.diagm([1.0 for i in 1:N])
-# Q2 = rand(M, 10)#0.2*linalg.diagm(1.0:N)
-# b = rand(M)
-# # Q = Q * Q'
-# # print(Q)
-# test = QPBlockData{Float64}()
-# c = rand(rng, N)
-# model = Model(Ipopt.Optimizer)
-# @variable(model, x[1:N])
-# @objective(model, MIN_SENSE, 0.5 * x' * Q * x + c' * x)
-# @constraint(model, Q2 * x >= b)
-# optimize!(model)
-# Z = zeros(Float64, N, N)
-# y = MOI.VariableIndex.(1:N)
-# for i in 1:M
-#     f = to_moi(y, Z, -Q2[i,:], b[i])
-#     MOI.add_constraint(test, f, MOI.LessThan(0.0))
-# end
-# fobj = to_moi(y, Q, c, 0.0)
-# MOI.set(test, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}(), fobj)
-# # vals = 
+
+function to_real_rep(mat)
+    N = size(mat)[1]
+    real_rep = sp.spzeros(2*N, 2*N)
+    G = real.(mat)
+    B = imag.(mat)
+    copyto!(real_rep, CartesianIndices((1:N, 1:N)), G, CartesianIndices((1:N, 1:N)))
+    copyto!(real_rep, CartesianIndices((1:N, N+1:2N)), -B, CartesianIndices((1:N, 1:N)))
+    copyto!(real_rep, CartesianIndices((N+1:2N, 1:N)), B, CartesianIndices((1:N, 1:N)))
+    copyto!(real_rep, CartesianIndices((N+1:2N, N+1:2N)), G, CartesianIndices((1:N, 1:N)))
+    return real_rep
+end
+
+mutable struct PowerFlowProblem 
+    n::Int
+    M::Vector{sp.SparseMatrixCSC{Float64, Int}}
+    C::Vector{Float64}
+    q::Vector{Float64}
+    Ψ::Vector{sp.SparseMatrixCSC{Float64, Int}}
+    Φ::Vector{sp.SparseMatrixCSC{Float64, Int}}
+    p_upper::Vector{Float64}
+    p_lower::Vector{Float64}
+    q_upper::Vector{Float64}
+    q_lower::Vector{Float64}
+    p_load::Vector{Float64}
+    q_load::Vector{Float64}
+    v_mag_min::Vector{Float64}
+    v_mag_max::Vector{Float64}
+    reference_bus::Int
+    function PowerFlowProblem(data::Dict) 
+        Y = calc_admittance_matrix(data).matrix
+        Ψ = [] # Hermitian components of Y
+        Φ = [] # Skew-Hermitian components of Y
+        p_upper = []
+        p_lower = []
+        q_upper = []
+        q_lower = []
+        p_load = []
+        q_load = []
+        v_mag_min = []
+        v_mag_max = []
+        reference_bus = -1
+        N = size(Y)[1]
+        q = zeros(N)
+        C = zeros(N)
+        M = []
+        # M_inds = []
+        # M_
+        # C = sp.SparseMatrixCSC{Float64, Int};
+        norm = data["baseMVA"]
+        for j in 1:N
+            eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep(Eⱼ * Y);Φⱼ = to_real_rep(-im * Eⱼ * Y);
+            push!(Ψ, Ψⱼ)
+            push!(Φ, Φⱼ)
+            push!(p_upper, data["gen"]["$(j)"]["pmax"] / norm)
+            push!(q_upper, data["gen"]["$(j)"]["qmax"] / norm)
+            push!(p_lower, data["gen"]["$(j)"]["pmin"] / norm)
+            push!(q_lower, data["gen"]["$(j)"]["qmin"] / norm)
+            push!(p_load, data["load"]["$(j)"]["pd"] / norm)
+            push!(q_load, data["load"]["$(j)"]["qd"] / norm)
+            push!(v_mag_min, data["bus"]["$(j)"]["vmin"]^2)
+            push!(v_mag_max, data["bus"]["$(j)"]["vmax"]^2)
+            push!(M, sp.sparse([j, j+N, 2N], [j, j+N, 2N], [1, 1, 0.0]))
+            if data["bus"]["$(j)"]["bus_type"] == 3
+                reference_bus = j
+            end
+            if size(data["gen"]["$(j)"]["cost"])[1] > 0
+                q[j] = data["gen"]["$(j)"]["cost"][2]
+                C[j] = data["gen"]["$(j)"]["cost"][1]
+            end
+        end
+        return new(
+            N,
+            M,
+            C,
+            q,
+            Ψ,
+            Φ,
+            p_upper,
+            p_lower,
+            q_upper,
+            q_lower,
+            p_load,
+            q_load,
+            v_mag_min,
+            v_mag_max,
+            reference_bus
+        )
+    end
+end
+function split_variables(p::PowerFlowProblem) 
+    V = x[1:2p.N]
+    λ̄  = x[2p.N+1:2p.N+N+1]
+    λ̄  = x[2p.N+1:2p.N+N+1]
+end
+
+function calc_power_gradient(p::PowerFlowProblem,
+                             x::Vector{Float64},
+                             dx::Vector{Float64})
+    n = p.n
+    V = x[1:2n]
+    λᵘ = x[2n+1:3n]
+    λˡ = x[3n+1:4n]
+    γᵘ = x[4n+1:5n]
+    γˡ = x[5n+1:6n]
+    μᵘ = x[6n+1:7n]
+    μˡ = x[7n+1:end]
+    dV = dx[1:2n]
+    dλᵘ = dx[2n+1:3n]
+    dλˡ = dx[3n+1:4n]
+    dγᵘ = dx[4n+1:5n]
+    dγˡ = dx[5n+1:6n]
+    dμᵘ = dx[6n+1:7n]
+    dμˡ = dx[7n+1:end]
+    for (j, (quad_cost, lin_cost, Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
+            p.C, p.q, p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
+        p_j = V' * Ψⱼ * V
+        q_j = V' * Φⱼ * V
+        mag_j = V' * Mⱼ * V
+        dV .-= 2 * ( 2 * quad_cost * (p_j + pd) .* Ψⱼ + lin_cost * Ψⱼ + 
+                    (λᵘ[j]-λˡ[j]) * Ψⱼ + 
+                    (γᵘ[j]-γˡ[j]) * Φⱼ + 
+                    (μᵘ[j]-μˡ[j]) * Mⱼ) * V
+        dλˡ[j] = pmin - pd - p_j
+        dλᵘ[j] = -(pmax - pd - p_j)
+        dγˡ[j] = qmin - qd - q_j
+        dγᵘ[j] = -(qmax - qd - q_j)
+        dμˡ[j] = (vmin - mag_j)
+        dμᵘ[j] = -(vmax - mag_j)
+    end
+    dV[end] -= 2 * V[end]
+    dV = min.(dV, 10000.)
+    dV = max.(dV, -10000.)
+    dx .= vcat(dV, dλˡ, dλᵘ, dγˡ, dγᵘ, dμˡ, dμᵘ)
+end
+function eval_objective(p::PowerFlowProblem, V::Vector{Float64})
+    result = 0.0
+    for j in 1:p.n
+        quad_cost = p.C[j]
+        lin_cost = p.q[j]
+        println(V' * p.Ψ[j] * V)
+        power_value = V' * p.Ψ[j] * V + p.p_load[j]
+        result += quad_cost * power_value^2 + lin_cost * power_value
+        
+    end
+    return result
+end
+function eval_constraints(p::PowerFlowProblem, V::Vector{Float64})
+    dλᵘ = zeros(p.n)
+    dλˡ = zeros(p.n)
+    dγᵘ = zeros(p.n)
+    dγˡ = zeros(p.n)
+    dμᵘ = zeros(p.n)
+    dμˡ = zeros(p.n)
+    for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
+        p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
+        p_j = V' * Ψⱼ * V
+        q_j = V' * Φⱼ * V
+        mag_j = V' * Mⱼ * V
+        dλˡ[j] = pmin - pd - p_j
+        dλᵘ[j] = -(pmax - pd - p_j)
+        dγˡ[j] = qmin - qd - q_j
+        dγᵘ[j] = -(qmax - qd - q_j)
+        dμˡ[j] = (vmin - mag_j)
+        dμᵘ[j] = -(vmax - mag_j)
+    end
+    return vcat(dλᵘ, dλˡ, dγᵘ, dγˡ, dμᵘ, dμˡ)
+end
+
+function solve_pddyn(
+    problem::PowerFlowProblem;
+    tstop::Float64 = 5000.0,
+    τ::Float64 = 1e-5,
+    verbose::Bool = true,
+    log_freq::Int = 10_000,
+)
+    printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
+    printf(x::Int) = Printf.@sprintf("%6d", x)
+    n = problem.n
+    function grad(dx, x, t)
+        fill!(dx, 0)
+        calc_power_gradient(problem, x, dx)
+        x[2n+1:end] .= max.(x[2n+1:end], 0)
+        x[1:2n] .= min.(max.(x[1:2n], 0.9), 1.1)
+    end
+    integrator = RK45Integrator(8n, τ)
+    time = 0.0
+
+    x = rand(8n)
+    k = 0
+    while time < tstop
+        # Take a single gradient step
+        # fill!(grad, 0.)
+        rks_step!(integrator, x, grad, time)
+        x[2n+1:end] .= max.(x[2n+1:end], 0)
+        x[1:2n] .= min.(max.(x[1:2n], 0.9), 1.1)
+        if verbose && (mod(k, log_freq) == 0)
+            testvec = eval_constraints(problem, x[1:2n])
+            comp = testvec .* x[2n+1:end]
+            logs = printf.((time, eval_objective(problem, x[1:2n]), max(testvec...), norm(comp)))
+            println(join(logs, "\t"))
+            
+        end
+        time += τ   
+        k += 1
+    end
+    
+    V = x[1:n]
+    λᵘ = x[n+1:2n]
+    λˡ = x[2n+1:3n]
+    γᵘ = x[3n+1:4n]
+    γˡ = x[4n+1:5n]
+    μᵘ = x[5n+1:6n]
+    μˡ = x[6n+1:end]
+    return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ
+end

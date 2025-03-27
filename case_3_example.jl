@@ -37,6 +37,7 @@ end
 
 pm = instantiate_model(data, ACRPowerModel, PowerModels.build_opf);
 model = pm.model.moi_backend
+N = 3
 # set_silent(pm.model)
 result = optimize_model!(pm, optimizer=Ipopt.Optimizer)
 V = vcat([result["solution"]["bus"]["$(i)"]["vr"] for i in 1:3], [result["solution"]["bus"]["$(i)"]["vi"] for i in 1:3])
