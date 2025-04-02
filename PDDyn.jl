@@ -6,6 +6,7 @@ using Ipopt
 using LinearAlgebra
 using Random
 using PowerModels
+using DifferentialEquations
 rng = MersenneTwister(123)
 
 include("utilities.jl")
@@ -53,15 +54,15 @@ function get_grad(
         problem::QPBlockData{Float64},
         J::Vector{Float64},
         structure::Vector{Tuple{Int64, Int64}},
-        dprimal::Vector{Float64},
-        ddual::Vector{Float64},
-        primal::Vector{Float64},
-        dual::Vector{Float64})
+        dprimal::Vector,
+        ddual::Vector,
+        primal,
+        dual)
     # First get the primal gradient
     MOI.eval_objective_gradient(problem, dprimal, primal)
     _ = MOI.eval_constraint_jacobian(problem, J, primal)
     for ((i, j), val) in zip(structure, J)
-        dprimal[j] += dual[i] * val
+        dprimal[j] += ForwardDiff.value(dual[i] * val)
     end
     # Now get the objective gradient
     MOI.eval_constraint(problem, ddual, primal);
@@ -121,7 +122,7 @@ function solve_pddyn(
     # copyto!(primal_dual_system, primal_dual_inds, A', CartesianIndices(A'))
     # Projected gradient descent on Lagrangian
     #       L(x, \lambda) = 
-    function grad(dx, x, t)
+    function grad(dx, x, p, t)
         dprimal = zeros(n)
         ddual = zeros(m)
         get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end])
@@ -129,38 +130,50 @@ function solve_pddyn(
         dx[n+1:end] .= ddual
         x.= min.(max.(x, lbounds), ubounds)
     end
-    integrator = RK45Integrator(n+m, τ)
     time = 0.0
     x = rand(n+m)
+    for i in 1:100 
+        τ_stop = tstop / 100
+        odeproblem = ODEProblem(grad, x, (0.0, τ_stop))
+        result = solve(odeproblem,Rodas5P(), save_everystep = false);
+        x = result.u[end]
+        testvec = fill(0.0, m);
+        MOI.eval_constraint(problem, testvec, x[1:n])
+        comp = testvec .* x[n+1:end]
+        # print(testvec)
+        logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
+        # println(testvec .* x[n+1:end])
+        println(join(logs, "\t"))
+    end
     k = 0
     status = MOI.OTHER_ERROR
-    while status == MOI.OTHER_ERROR && time < tstop
-        # Take a single gradient step
-        rks_step!(integrator, x, grad, time)
-        x.= min.(max.(x, lbounds), ubounds)
-        # x[1:n] .= max.(x[1:n], 0.0)
-        # x[1:n] .= min.(x[1:n], ubounds)
-        if time >= tstop
-            status = MOI.ITERATION_LIMIT
-        end
-        if verbose && (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
-            if m > 0
-                testvec = fill(0.0, m);
-                MOI.eval_constraint(problem, testvec, x[1:n])
-                comp = testvec .* x[n+1:end]
-                # print(testvec)
-                logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
-                # println(testvec .* x[n+1:end])
-                println(join(logs, "\t"))
-            else
-                logs = printf.((time, MOI.eval_objective(problem, x[1:n])))
-                # println(testvec .* x[n+1:end])
-                println(join(logs, "\t"))
-            end
-        end
-        time += τ   
-        k += 1
-    end
+    # while status == MOI.OTHER_ERROR && time < tstop
+    #     # Take a single gradient step
+    #     rks_step!(integrator, x, grad, time)
+    #     x.= min.(max.(x, lbounds), ubounds)
+    #     # x[1:n] .= max.(x[1:n], 0.0)
+    #     # x[1:n] .= min.(x[1:n], ubounds)
+    #     if time >= tstop
+    #         status = MOI.ITERATION_LIMIT
+    #     end
+    #     if verbose && (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
+    #         if m > 0
+    #             testvec = fill(0.0, m);
+    #             MOI.eval_constraint(problem, testvec, x[1:n])
+    #             comp = testvec .* x[n+1:end]
+    #             # print(testvec)
+    #             logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
+    #             # println(testvec .* x[n+1:end])
+    #             println(join(logs, "\t"))
+    #         else
+    #             logs = printf.((time, MOI.eval_objective(problem, x[1:n])))
+    #             # println(testvec .* x[n+1:end])
+    #             println(join(logs, "\t"))
+    #         end
+    #     end
+    #     time += τ   
+    #     k += 1
+    # end
     if post_sample
         grad_buff = zeros(n+m)
         scratch_vals = zeros(m)
@@ -169,7 +182,7 @@ function solve_pddyn(
         bestx = zeros(n+m)
         copy!(bestx, x)
         for i in 1:n_iter
-            grad(grad_buff, x, time)
+            grad(grad_buff, x, Nothing, time)
             grad_buff[1:n] .+= 1 / 256 * (sqrt( 1 / 1e-4)) * randn(n)
             x += 1e-4 * grad_buff;
             x[n+1:end] .= max.(0., x[n+1:end])
@@ -187,10 +200,6 @@ function solve_pddyn(
                     best_obj = obj
                     println(best_obj);
                 end
-                # comp = testvec .* scratch_vals[n+1:end]./i
-                # logs = printf.((time, MOI.eval_objective(problem, scratch_vals[1:n]./i), max(testvec...), norm(comp)))
-                # println(testvec .* x[n+1:end])
-                # println(join(logs, "\t"))
             end
             time += τ   
         end
@@ -231,8 +240,8 @@ function main_test()
     clist = []
     blist = []
     M = 40
+    println(max_coeff)
     for i in 1:M
-        global maxcoeff
         c = rand(rng,N)
         Q = rand(rng,N, N)
         # Q = Q * Q' 
@@ -276,8 +285,9 @@ function main_test()
     # res = solve_pddyn(test, N, tstop=50.,τ=1e-3);
     println("======== Quantized ==============")
     # res3 = solve_pddyn(testq, N, tstop=50.,τ=1e-3, post_sample=false );
-
-    res2 = solve_pddyn(testq, N, tstop=30.,τ=1e-3);
+    lbounds = vcat([-Inf for i in 1:N],[0 for i in 1:M])
+    ubounds = vcat([Inf for i in 1:N],[Inf for i in 1:M])
+    res2 = solve_pddyn(test, N, lbounds, ubounds, tstop=30.,τ=1e-3);
     # obj1 = MOI.eval_objective(test, res[3])
     obj2 = MOI.eval_objective(test, res2[3])
     constvec = zeros(M)
@@ -493,7 +503,7 @@ function solve_pddyn(
     printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
     printf(x::Int) = Printf.@sprintf("%6d", x)
     n = problem.n
-    function grad(dx, x, t)
+    function grad(dx, x, p, t)
         fill!(dx, 0)
         calc_power_gradient(problem, x, dx)
         x[2n+1:end] .= max.(x[2n+1:end], 0)
@@ -501,6 +511,7 @@ function solve_pddyn(
     end
     integrator = RK45Integrator(8n, τ)
     time = 0.0
+    prob = ODEProblem(grad, rand(8n), (0, tstop))
 
     x = rand(8n)
     k = 0
