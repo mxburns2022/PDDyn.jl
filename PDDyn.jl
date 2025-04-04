@@ -8,7 +8,7 @@ using Random
 using PowerModels
 using DifferentialEquations
 rng = MersenneTwister(123)
-
+using Plots
 include("utilities.jl")
 include("rk45.jl")
 # import Printf
@@ -339,11 +339,14 @@ end
 
 mutable struct PowerFlowProblem 
     n::Int
+    nbr::Int
     M::Vector{sp.SparseMatrixCSC{Float64, Int}}
     C::Vector{Float64}
     q::Vector{Float64}
     Ψ::Vector{sp.SparseMatrixCSC{Float64, Int}}
+    Ψbr::Vector{sp.SparseMatrixCSC{Float64, Int}}
     Φ::Vector{sp.SparseMatrixCSC{Float64, Int}}
+    Φbr::Vector{sp.SparseMatrixCSC{Float64, Int}}
     p_upper::Vector{Float64}
     p_lower::Vector{Float64}
     q_upper::Vector{Float64}
@@ -352,11 +355,14 @@ mutable struct PowerFlowProblem
     q_load::Vector{Float64}
     v_mag_min::Vector{Float64}
     v_mag_max::Vector{Float64}
+    s_max::Vector{Float64}
     reference_bus::Int
     function PowerFlowProblem(data::Dict) 
         Y = calc_admittance_matrix(data).matrix
         Ψ = [] # Hermitian components of Y
+        Ψbr = [] # Hermitian components of Y (branchess)
         Φ = [] # Skew-Hermitian components of Y
+        Φbr = [] # Skew-Hermitian components of Y
         p_upper = []
         p_lower = []
         q_upper = []
@@ -365,11 +371,13 @@ mutable struct PowerFlowProblem
         q_load = []
         v_mag_min = []
         v_mag_max = []
+        s_max = []
         reference_bus = -1
         N = size(Y)[1]
         q = zeros(N)
         C = zeros(N)
         M = []
+        Nbr = length(data["branch"])
         # M_inds = []
         # M_
         # C = sp.SparseMatrixCSC{Float64, Int};
@@ -378,12 +386,12 @@ mutable struct PowerFlowProblem
             eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep(Eⱼ * Y);Φⱼ = to_real_rep(-im * Eⱼ * Y);
             push!(Ψ, Ψⱼ)
             push!(Φ, Φⱼ)
-            push!(p_upper, data["gen"]["$(j)"]["pmax"] / norm)
-            push!(q_upper, data["gen"]["$(j)"]["qmax"] / norm)
-            push!(p_lower, data["gen"]["$(j)"]["pmin"] / norm)
-            push!(q_lower, data["gen"]["$(j)"]["qmin"] / norm)
-            push!(p_load, data["load"]["$(j)"]["pd"] / norm)
-            push!(q_load, data["load"]["$(j)"]["qd"] / norm)
+            push!(p_upper, data["gen"]["$(j)"]["pmax"])
+            push!(q_upper, data["gen"]["$(j)"]["qmax"])
+            push!(p_lower, data["gen"]["$(j)"]["pmin"])
+            push!(q_lower, data["gen"]["$(j)"]["qmin"])
+            push!(p_load, data["load"]["$(j)"]["pd"])
+            push!(q_load, data["load"]["$(j)"]["qd"])
             push!(v_mag_min, data["bus"]["$(j)"]["vmin"]^2)
             push!(v_mag_max, data["bus"]["$(j)"]["vmax"]^2)
             push!(M, sp.sparse([j, j+N, 2N], [j, j+N, 2N], [1, 1, 0.0]))
@@ -395,13 +403,27 @@ mutable struct PowerFlowProblem
                 C[j] = data["gen"]["$(j)"]["cost"][1]
             end
         end
+        for (_, brdata) in pairs(data["branch"])
+            srcnode = brdata["f_bus"]
+            destnode = brdata["t_bus"]
+            eᵢ = zeros(N); eᵢ[srcnode] = 1; Eᵢ = diagm(eᵢ);
+            eⱼ = zeros(N); eⱼ[destnode] = 1; Eⱼ = diagm(eⱼ);
+            Ψⱼ = to_real_rep((Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
+            Φⱼ = to_real_rep(-im * (Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
+            push!(Ψbr, Ψⱼ)
+            push!(Φbr, Φⱼ)
+            push!(s_max, brdata["rate_a"]^2 / norm^2)
+        end
         return new(
             N,
+            Nbr,
             M,
             C,
             q,
             Ψ,
+            Ψbr,
             Φ,
+            Φbr,
             p_upper,
             p_lower,
             q_upper,
@@ -410,19 +432,15 @@ mutable struct PowerFlowProblem
             q_load,
             v_mag_min,
             v_mag_max,
+            s_max,
             reference_bus
         )
     end
 end
-function split_variables(p::PowerFlowProblem) 
-    V = x[1:2p.N]
-    λ̄  = x[2p.N+1:2p.N+N+1]
-    λ̄  = x[2p.N+1:2p.N+N+1]
-end
 
 function calc_power_gradient(p::PowerFlowProblem,
-                             x::Vector{Float64},
-                             dx::Vector{Float64})
+                             x::AbstractVector,
+                             dx::AbstractVector)
     n = p.n
     V = x[1:2n]
     λᵘ = x[2n+1:3n]
@@ -430,44 +448,62 @@ function calc_power_gradient(p::PowerFlowProblem,
     γᵘ = x[4n+1:5n]
     γˡ = x[5n+1:6n]
     μᵘ = x[6n+1:7n]
-    μˡ = x[7n+1:end]
+    μˡ = x[7n+1:8n]
+    ν = x[8n+1:end]
+
     dV = dx[1:2n]
     dλᵘ = dx[2n+1:3n]
     dλˡ = dx[3n+1:4n]
     dγᵘ = dx[4n+1:5n]
     dγˡ = dx[5n+1:6n]
     dμᵘ = dx[6n+1:7n]
-    dμˡ = dx[7n+1:end]
+    dμˡ = dx[7n+1:8n]
+    dν = dx[8n+1:end]
+    # dνˡᵢ = dx[10n+1:11n]
+    # dνᵘᵢ = dx[11n+1:12n]
     for (j, (quad_cost, lin_cost, Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
             p.C, p.q, p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
         p_j = V' * Ψⱼ * V
         q_j = V' * Φⱼ * V
-        mag_j = V' * Mⱼ * V
-        dV .-= 2 * ( 2 * quad_cost * (p_j + pd) .* Ψⱼ + lin_cost * Ψⱼ + 
-                    (λᵘ[j]-λˡ[j]) * Ψⱼ + 
-                    (γᵘ[j]-γˡ[j]) * Φⱼ + 
-                    (μᵘ[j]-μˡ[j]) * Mⱼ) * V
+        mag_j = V[j]^2 + V[j+n]^2
+        # $$ \frac{}{} $$
+        dV .-=  (2 * quad_cost * (p_j + pd) .*(Ψⱼ + Ψⱼ') + 2 *lin_cost .* (Ψⱼ + Ψⱼ') + 
+                    (λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
+                    (γᵘ[j]-γˡ[j]) * (Φⱼ +  Φⱼ') + 
+                    2(μᵘ[j]-μˡ[j]) * Mⱼ) * V
+        # dV .-= 2 * ((λᵘ[j]-λˡ[j]) * Ψⱼ + 
+        #             (γᵘ[j]-γˡ[j]) * Φⱼ + 
+        #             (μᵘ[j]-μˡ[j]) * Mⱼ) * V
         dλˡ[j] = pmin - pd - p_j
-        dλᵘ[j] = -(pmax - pd - p_j)
+        dλᵘ[j] = pd + p_j - pmax
         dγˡ[j] = qmin - qd - q_j
-        dγᵘ[j] = -(qmax - qd - q_j)
-        dμˡ[j] = (vmin - mag_j)
-        dμᵘ[j] = -(vmax - mag_j)
+        dγᵘ[j] = qd + q_j - qmax
+        dμˡ[j] = vmin - mag_j
+        dμᵘ[j] = mag_j - vmax
     end
-    dV[end] -= 2 * V[end]
-    dV = min.(dV, 10000.)
-    dV = max.(dV, -10000.)
-    dx .= vcat(dV, dλˡ, dλᵘ, dγˡ, dγᵘ, dμˡ, dμᵘ)
+    for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
+        p_br_j = V' * Ψⱼ * V
+        q_br_j = V' * Φⱼ * V
+        dV .-=  2ν[j].*(p_br_j*(Ψⱼ + Ψⱼ') + q_br_j * (Φⱼ +  Φⱼ')) * V
+        dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
+    end
+    dλˡ .*= convert.(Float64, max.((dλˡ .> 0.), λˡ .> 0.))
+    dγˡ .*= convert.(Float64, max.((dγˡ .> 0.), γˡ .> 0.))
+    dμˡ .*= convert.(Float64, max.((dμˡ .> 0.), μˡ .> 0.))
+    dγᵘ .*= convert.(Float64, max.((dγᵘ .> 0.), γᵘ .> 0.))
+    dλᵘ .*= convert.(Float64, max.((dλᵘ .> 0.), λᵘ .> 0.))
+    dμᵘ .*= convert.(Float64, max.((dμᵘ .> 0.), μᵘ .> 0.))
+    dν .*= convert.(Float64, max.((dν .> 0.), ν .> 0.))
+    dV[n+1] -= 2 * V[n+1]
+    dx .= vcat(dV, dλᵘ, dλˡ,  dγᵘ,dγˡ, dμᵘ,  dμˡ, dν)
 end
 function eval_objective(p::PowerFlowProblem, V::Vector{Float64})
     result = 0.0
     for j in 1:p.n
         quad_cost = p.C[j]
         lin_cost = p.q[j]
-        println(V' * p.Ψ[j] * V)
         power_value = V' * p.Ψ[j] * V + p.p_load[j]
         result += quad_cost * power_value^2 + lin_cost * power_value
-        
     end
     return result
 end
@@ -478,6 +514,7 @@ function eval_constraints(p::PowerFlowProblem, V::Vector{Float64})
     dγˡ = zeros(p.n)
     dμᵘ = zeros(p.n)
     dμˡ = zeros(p.n)
+    dν = zeros(p.nbr)
     for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
         p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
         p_j = V' * Ψⱼ * V
@@ -490,12 +527,17 @@ function eval_constraints(p::PowerFlowProblem, V::Vector{Float64})
         dμˡ[j] = (vmin - mag_j)
         dμᵘ[j] = -(vmax - mag_j)
     end
-    return vcat(dλᵘ, dλˡ, dγᵘ, dγˡ, dμᵘ, dμˡ)
+    for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
+        p_br_j = V' * Ψⱼ * V
+        q_br_j = V' * Φⱼ * V
+        dν[j] = p_br_j^2 + p_br_j^2 - sⱼ
+    end
+    return vcat(dλᵘ, dλˡ, dγᵘ, dγˡ, dμᵘ, dμˡ, dν)
 end
 
 function solve_pddyn(
     problem::PowerFlowProblem;
-    tstop::Float64 = 5000.0,
+    tstop::Float64 = 200000.0,
     τ::Float64 = 1e-5,
     verbose::Bool = true,
     log_freq::Int = 10_000,
@@ -505,39 +547,67 @@ function solve_pddyn(
     n = problem.n
     function grad(dx, x, p, t)
         fill!(dx, 0)
+        # x[1:2n] .= min.(max.(x[1:2n], -1.1), 1.1)
+        x[2n+1:end] .= max.(x[2n+1:end], 0)
         calc_power_gradient(problem, x, dx)
-        x[2n+1:end] .= max.(x[2n+1:end], 0)
-        x[1:2n] .= min.(max.(x[1:2n], 0.9), 1.1)
     end
-    integrator = RK45Integrator(8n, τ)
-    time = 0.0
-    prob = ODEProblem(grad, rand(8n), (0, tstop))
-
-    x = rand(8n)
-    k = 0
-    while time < tstop
-        # Take a single gradient step
-        # fill!(grad, 0.)
-        rks_step!(integrator, x, grad, time)
-        x[2n+1:end] .= max.(x[2n+1:end], 0)
-        x[1:2n] .= min.(max.(x[1:2n], 0.9), 1.1)
-        if verbose && (mod(k, log_freq) == 0)
+    x = rand(8n + problem.nbr)
+    # x[1:2n] = [1.1000000050616032, 1.0864554011184095, 1.0773745270552761, 4.6790506294074145e-35, 0.17208914221302823, -0.22195526495444665]
+    x[2n+1:end] .= 0
+    println(eval_objective(problem, x[1:2n]))
+    result = Nothing
+    for i in 1:1
+        τ_stop = tstop / 1
+        odeproblem = ODEProblem(grad, x, (0.0, τ_stop))
+        result = solve(odeproblem, TRBDF2(), save_everystep=true);
+        fvals = []
+        for x in result.u
             testvec = eval_constraints(problem, x[1:2n])
             comp = testvec .* x[2n+1:end]
-            logs = printf.((time, eval_objective(problem, x[1:2n]), max(testvec...), norm(comp)))
-            println(join(logs, "\t"))
-            
+            # print(testvec)
+            eval = eval_objective(problem, x[1:2n])
+            println(eval)
+            println(x[1:2n])
+            push!(fvals, eval)
+            # logs = printf.((i * τ_stop, eval_objective(problem, x[1:2n]), max(testvec...), norm(comp)))
+            # println(testvec .* x[n+1:end])
+            # println(join(logs, "\t"))
+            # plot!()
         end
-        time += τ   
-        k += 1
+        pltval = plot(fvals)
+        display(pltval)
+        x = result.u[end]
+        testvec = eval_constraints(problem, x[1:2n])
+        println(x)
+        println(testvec)
+        
     end
+    # x = rand(8n)
+    # k = 0
     
-    V = x[1:n]
-    λᵘ = x[n+1:2n]
-    λˡ = x[2n+1:3n]
-    γᵘ = x[3n+1:4n]
-    γˡ = x[4n+1:5n]
-    μᵘ = x[5n+1:6n]
-    μˡ = x[6n+1:end]
+    # while time < tstop
+    #     # Take a single gradient step
+    #     # fill!(grad, 0.)
+    #     rks_step!(integrator, x, grad, time)
+    #     x[2n+1:end] .= max.(x[2n+1:end], 0)
+    #     x[1:2n] .= min.(max.(x[1:2n], 0.9), 1.1)
+    #     if verbose && (mod(k, log_freq) == 0)
+    #         testvec = eval_constraints(problem, x[1:2n])
+    #         comp = testvec .* x[2n+1:end]
+    #         logs = printf.((time, eval_objective(problem, x[1:2n]), max(testvec...), norm(comp)))
+    #         println(join(logs, "\t"))
+            
+    #     end
+    #     time += τ   
+    #     k += 1
+    # end
+    
+    V = x[1:2n]
+    λᵘ = x[2n+1:4n]
+    λˡ = x[3n+1:4n]
+    γᵘ = x[4n+1:5n]
+    γˡ = x[5n+1:6n]
+    μᵘ = x[6n+1:7n]
+    μˡ = x[7n+1:8n]
     return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ
 end

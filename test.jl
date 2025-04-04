@@ -10,6 +10,6 @@ include("pdhg.jl")
 # Q .*= .1
 # Q = c*c'
 base_path = ENV["BENCH"] * "/gridopt/pglib-opf"
-power_file = base_path * "/pglib_opf_case14_ieee.m"
+power_file = base_path * "/pglib_opf_case3_lmbd.m"
 data = PM.parse_file(power_file)
 model =  PM.instantiate_model(data, PM.ACRPowerModel, PM.build_opf).model
