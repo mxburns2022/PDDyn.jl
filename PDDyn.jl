@@ -15,6 +15,9 @@ include("rk45.jl")
 
 
 function quantize(x::Float64, step::Float64)
+    if step == 0
+        return x
+    end
     return round(x / step) * step
 end
 
@@ -57,7 +60,8 @@ function get_grad(
         dprimal::Vector,
         ddual::Vector,
         primal,
-        dual)
+        dual,
+        lbounds)
     # First get the primal gradient
     MOI.eval_objective_gradient(problem, dprimal, primal)
     _ = MOI.eval_constraint_jacobian(problem, J, primal)
@@ -66,30 +70,9 @@ function get_grad(
     end
     # Now get the objective gradient
     MOI.eval_constraint(problem, ddual, primal);
-    # ddual ./= problem.norm_constant
-    # dprimal ./= problem.norm_constant
+    # ddual .= max.(ddual, lbounds[size(dprimal)[1]+1,end])
 end
-function get_proximal_primal_grad(
-        problem::QPBlockData{Float64},
-        J::Vector{Float64},
-        structure::Vector{Tuple{Int64, Int64}},
-        dprimal::Vector{Float64},
-        ddual::Vector{Float64},
-        primal::Vector{Float64},
-        previous::Vector{Float64},
-        reg::Float64,
-        dual::Vector{Float64})
-    # First get the primal gradient
-    MOI.eval_objective_gradient(problem, dprimal, primal)
-    _ = MOI.eval_constraint_jacobian(problem, J, primal)
-    for ((i, j), val) in zip(structure, J)
-        dprimal[j] += dual[i] * val
-    end
-    dprimal .+= primal - (previous .* reg)
 
-    # Now get the objective gradient
-    MOI.eval_constraint(problem, ddual, primal);
-end
 function get_dual_grad(
     problem::QPBlockData{Float64},
     ddual::Vector{Float64},
@@ -103,11 +86,11 @@ function solve_pddyn(
     n::Int,
     lbounds::Vector{Float64},
     ubounds::Vector{Float64};
-    tstop::Float64 = 5000.0,
-    τ::Float64 = 1e-3,
-    tol::Float64 = 1e-5,
+    tstop::Float64 = 10.0,
+    τ::Float64 = 1e-5,
+    tol::Float64 = 1e-6,
     verbose::Bool = true,
-    log_freq::Int = 10_000,
+    log_freq::Int = 1000,
     post_sample::Bool = false,
     target::Union{QPBlockData{Float64}, Type{Nothing}} = Nothing
 )
@@ -122,89 +105,67 @@ function solve_pddyn(
     # copyto!(primal_dual_system, primal_dual_inds, A', CartesianIndices(A'))
     # Projected gradient descent on Lagrangian
     #       L(x, \lambda) = 
-    function grad(dx, x, p, t)
+    inequality_indices = Int[]
+    for i in n+1:n+m
+        if lbounds[i] == 0.0
+            push!(inequality_indices, i)
+        end
+    end
+    function grad(dx, x, t)
         dprimal = zeros(n)
         ddual = zeros(m)
-        get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end])
+        get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end],lbounds)
         dx[1:n] .= -dprimal
         dx[n+1:end] .= ddual
-        x.= min.(max.(x, lbounds), ubounds)
+        ineq_grad = dx[indequality_indices] 
+        ineq_vars = x[indequality_indices] 
+        dx[indequality_indices] .*= convert.(Float64, max.((ineq_grad .> 0.), ineq_vars .> 0.))
+        # dλˡ .*= convert.(Float64, max.((dλˡ .> 0.), λˡ .> 0.))
+        # x.= min.(max.(x, lbounds), ubounds)
+        # x[n+1:end] .= max.(0., x[n+1:end])
     end
     time = 0.0
+    x = randn(n+m)
+    fill(x[m+1:end], 0)
+    integrator = RK45Integrator(n+m, τ)
+    time = 0.0
     x = rand(n+m)
-    for i in 1:100 
-        τ_stop = tstop / 100
-        odeproblem = ODEProblem(grad, x, (0.0, τ_stop))
-        result = solve(odeproblem,Rodas5P(), save_everystep = false);
-        x = result.u[end]
-        testvec = fill(0.0, m);
-        MOI.eval_constraint(problem, testvec, x[1:n])
-        comp = testvec .* x[n+1:end]
-        # print(testvec)
-        logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
-        # println(testvec .* x[n+1:end])
-        println(join(logs, "\t"))
-    end
     k = 0
     status = MOI.OTHER_ERROR
-    # while status == MOI.OTHER_ERROR && time < tstop
-    #     # Take a single gradient step
-    #     rks_step!(integrator, x, grad, time)
-    #     x.= min.(max.(x, lbounds), ubounds)
-    #     # x[1:n] .= max.(x[1:n], 0.0)
-    #     # x[1:n] .= min.(x[1:n], ubounds)
-    #     if time >= tstop
-    #         status = MOI.ITERATION_LIMIT
-    #     end
-    #     if verbose && (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
-    #         if m > 0
-    #             testvec = fill(0.0, m);
-    #             MOI.eval_constraint(problem, testvec, x[1:n])
-    #             comp = testvec .* x[n+1:end]
-    #             # print(testvec)
-    #             logs = printf.((time, MOI.eval_objective(problem, x[1:n]), max(testvec...), norm(comp)))
-    #             # println(testvec .* x[n+1:end])
-    #             println(join(logs, "\t"))
-    #         else
-    #             logs = printf.((time, MOI.eval_objective(problem, x[1:n])))
-    #             # println(testvec .* x[n+1:end])
-    #             println(join(logs, "\t"))
-    #         end
-    #     end
-    #     time += τ   
-    #     k += 1
-    # end
-    if post_sample
-        grad_buff = zeros(n+m)
-        scratch_vals = zeros(m)
-        n_iter = 50000
-        best_obj = MOI.eval_objective(target, x[1:n])
-        bestx = zeros(n+m)
-        copy!(bestx, x)
-        for i in 1:n_iter
-            grad(grad_buff, x, Nothing, time)
-            grad_buff[1:n] .+= 1 / 256 * (sqrt( 1 / 1e-4)) * randn(n)
-            x += 1e-4 * grad_buff;
-            x[n+1:end] .= max.(0., x[n+1:end])
-            if time >= tstop
-                status = MOI.ITERATION_LIMIT
-            end
-            if verbose && (mod(i, log_freq) == 0 || status != MOI.OTHER_ERROR)
-                obj = MOI.eval_objective(target, x[1:n])
-                maxvio = max(scratch_vals...)
-                MOI.eval_constraint(target, scratch_vals, x[1:n])
-                if obj < best_obj && maxvio < 1e-6
-                    
-                    println(obj, best_obj);
-                    copy!(bestx, x)
-                    best_obj = obj
-                    println(best_obj);
-                end
-            end
-            time += τ   
+    prev_fval = Inf64
+    while status == MOI.OTHER_ERROR && time < tstop
+        
+        # Take a single gradient step
+        rks_step!(integrator, x, grad, time)
+        # odeproblem = ODEProblem(grad, x, (0.0, tstop))
+        # result = solve(odeproblem, TRBDF2(), save_everystep=false);
+        x.= min.(max.(x, lbounds), ubounds)
+        x[n+1:end] .= max.(0., x[n+1:end])
+        if time >= tstop
+            status = MOI.ITERATION_LIMIT
         end
-        copy!(x, bestx)
+        if (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
+            testvec = fill(0.0, m);
+            MOI.eval_constraint(problem, testvec, x[1:n])
+            comp = testvec .* x[n+1:end]
+            objective = MOI.eval_objective(problem, x[1:n])
+            if verbose
+                logs = printf.((time, MOI.eval_objective(problem, x[1:n]), maximum(testvec), norm(comp)))
+                # println(testvec .* x[n+1:end])
+                println(join(logs, "\t"))
+            end
+            if (norm(comp) < tol) && abs(objective-prev_fval) < tol &&  maximum(testvec) < tol
+                break
+            end
+            prev_fval = objective
+        end
+        time += τ   
+        k += 1
+        # break
     end
+    testvec = fill(0.0, m);
+    MOI.eval_constraint(problem, testvec, x[1:n])
+    objective = MOI.eval_objective(problem, x[1:n])
     status = MOI.LOCALLY_SOLVED
     constvec = zeros(m)
     MOI.eval_constraint(problem, constvec, x[1:n])
@@ -222,9 +183,11 @@ function solve_pddyn(
     end
     if complementarity < tol
         dual_status = MOI.FEASIBLE_POINT
+    else
+        dual_status = MOI.INFEASIBLE_POINT
     end
         
-    return status, primal_status, dual_status, time, x[1:n], x[n+1:m+n]
+    return status, primal_status, dual_status, time, objective, x[1:n], x[n+1:m+n]
 end
 
 
@@ -240,7 +203,6 @@ function main_test()
     clist = []
     blist = []
     M = 40
-    println(max_coeff)
     for i in 1:M
         c = rand(rng,N)
         Q = rand(rng,N, N)
@@ -357,6 +319,7 @@ mutable struct PowerFlowProblem
     v_mag_max::Vector{Float64}
     s_max::Vector{Float64}
     reference_bus::Int
+    max_coeff::Float64
     function PowerFlowProblem(data::Dict) 
         Y = calc_admittance_matrix(data).matrix
         Ψ = [] # Hermitian components of Y
@@ -382,38 +345,105 @@ mutable struct PowerFlowProblem
         # M_
         # C = sp.SparseMatrixCSC{Float64, Int};
         norm = data["baseMVA"]
+        bus_ids = Dict{Int, Int}()
+        bus_ids_inv = Dict{Int, Int}()
+        keyvalues = sort([parse(Int, i) for i in keys(data["bus"])])
+        for j in 1:N
+            bus_ids[keyvalues[j]] = j
+            bus_ids_inv[j] = keyvalues[j]
+        
+        end
+        print(bus_ids_inv)
         for j in 1:N
             eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep(Eⱼ * Y);Φⱼ = to_real_rep(-im * Eⱼ * Y);
             push!(Ψ, Ψⱼ)
             push!(Φ, Φⱼ)
-            push!(p_upper, data["gen"]["$(j)"]["pmax"])
-            push!(q_upper, data["gen"]["$(j)"]["qmax"])
-            push!(p_lower, data["gen"]["$(j)"]["pmin"])
-            push!(q_lower, data["gen"]["$(j)"]["qmin"])
-            push!(p_load, data["load"]["$(j)"]["pd"])
-            push!(q_load, data["load"]["$(j)"]["qd"])
-            push!(v_mag_min, data["bus"]["$(j)"]["vmin"]^2)
-            push!(v_mag_max, data["bus"]["$(j)"]["vmax"]^2)
+            bus_key = "$(bus_ids_inv[j])"
+            if bus_key in keys(data["gen"])
+                push!(p_upper, data["gen"][bus_key]["pmax"])
+                push!(q_upper, data["gen"][bus_key]["qmax"])
+                push!(p_lower, data["gen"][bus_key]["pmin"])
+                push!(q_lower, data["gen"][bus_key]["qmin"])
+                if size(data["gen"][bus_key]["cost"])[1] > 0
+                    q[j] = data["gen"][bus_key]["cost"][2]
+                    C[j] = data["gen"][bus_key]["cost"][1]
+                end
+            else 
+                push!(p_upper, 1e10)
+                push!(q_upper, 1e10)
+                push!(p_lower, -1e10)
+                push!(q_lower, -1e10)
+            end
+            if haskey(data["bus"], bus_key)
+                push!(v_mag_max, data["bus"][bus_key]["vmax"]^2)
+                push!(v_mag_min, data["bus"][bus_key]["vmin"]^2)
+                if data["bus"][bus_key]["bus_i"] == 3
+                    reference_bus = j
+                end
+            else
+                push!(v_mag_min, 0)
+                push!(v_mag_max, 1e10)
+            end
+            if bus_key in keys(data["load"])
+                push!(p_load, data["load"][bus_key]["pd"])
+                push!(q_load, data["load"][bus_key]["qd"])
+            else
+                push!(p_load, 0)
+                push!(q_load, 0)
+            end
+            
             push!(M, sp.sparse([j, j+N, 2N], [j, j+N, 2N], [1, 1, 0.0]))
-            if data["bus"]["$(j)"]["bus_type"] == 3
-                reference_bus = j
-            end
-            if size(data["gen"]["$(j)"]["cost"])[1] > 0
-                q[j] = data["gen"]["$(j)"]["cost"][2]
-                C[j] = data["gen"]["$(j)"]["cost"][1]
-            end
+            
         end
+        ΨT = to_real_rep(Y);
+        ΦT = to_real_rep(Y);
         for (_, brdata) in pairs(data["branch"])
-            srcnode = brdata["f_bus"]
-            destnode = brdata["t_bus"]
+            srcnode = bus_ids[brdata["f_bus"]]
+            destnode = bus_ids[brdata["t_bus"]]
             eᵢ = zeros(N); eᵢ[srcnode] = 1; Eᵢ = diagm(eᵢ);
             eⱼ = zeros(N); eⱼ[destnode] = 1; Eⱼ = diagm(eⱼ);
-            Ψⱼ = to_real_rep((Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
-            Φⱼ = to_real_rep(-im * (Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
+            Ψⱼ = sp.spzeros(size(ΨT))
+            Φⱼ = sp.spzeros(size(ΦT))
+            # Ψⱼ = to_real_rep((Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
+            # Φⱼ = to_real_rep(-im * (Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
+            Ψⱼ[srcnode, srcnode] = ΨT[srcnode, srcnode]
+            Ψⱼ[srcnode+N, srcnode+N] = ΨT[srcnode+N, srcnode+N]
+            Ψⱼ[srcnode, destnode] = ΨT[srcnode, destnode]
+            Ψⱼ[destnode, srcnode] = ΨT[destnode, srcnode]
+            Ψⱼ[srcnode+N, destnode+N] = ΨT[srcnode+N, destnode+N]
+            Ψⱼ[destnode+N, srcnode+N] = ΨT[destnode+N, srcnode+N]
+            Ψⱼ[srcnode, destnode+N] = ΨT[srcnode, destnode+N]
+            Ψⱼ[destnode+N, srcnode] = ΨT[destnode+N, srcnode]
+            Ψⱼ[srcnode+N, destnode] = ΨT[srcnode+N, destnode]
+            Ψⱼ[destnode, srcnode+N] = ΨT[destnode, srcnode+N]
+
+            Φⱼ[srcnode, srcnode] = ΦT[srcnode, srcnode]
+            Φⱼ[srcnode+N, srcnode+N] = ΦT[srcnode+N, srcnode+N]
+            Φⱼ[srcnode, destnode] = ΦT[srcnode, destnode]
+            Φⱼ[destnode, srcnode] = ΦT[destnode, srcnode]
+            Φⱼ[srcnode+N, destnode+N] = ΦT[srcnode+N, destnode+N]
+            Φⱼ[destnode+N, srcnode+N] = ΦT[destnode+N, srcnode+N]
+            Φⱼ[srcnode, destnode+N] = ΦT[srcnode, destnode+N]
+            Φⱼ[destnode+N, srcnode] = ΦT[destnode+N, srcnode]
+            Φⱼ[srcnode+N, destnode] = ΦT[srcnode+N, destnode]
+            Φⱼ[destnode, srcnode+N] = ΦT[destnode, srcnode+N]
+
+
+            # Ψⱼ[destnode, destnode] = 0
+            # Ψⱼ[destnode+N, destnode+N] = 0
+            # Ψⱼ[srcnode, srcnode] = 0
             push!(Ψbr, Ψⱼ)
             push!(Φbr, Φⱼ)
             push!(s_max, brdata["rate_a"]^2 / norm^2)
         end
+        function maxval(y)
+            if abs(y) > 1e8
+                return 0
+            end
+            return abs(y)
+        end
+        max_coeff = maximum([maximum([maximum(maxval.(j)) for j in i]) for i in [Ψ, Φ, M]])
+        max_coeff = max(maximum(maxval.(vcat(p_upper, p_lower, q_lower, q_upper, v_mag_max, v_mag_min))))
         return new(
             N,
             Nbr,
@@ -433,9 +463,134 @@ mutable struct PowerFlowProblem
             v_mag_min,
             v_mag_max,
             s_max,
-            reference_bus
+            reference_bus,
+            max_coeff
         )
     end
+    function PowerFlowProblem(
+        N,
+        Nbr,
+        M,
+        C,
+        q,
+        Ψ,
+        Ψbr,
+        Φ,
+        Φbr,
+        p_upper,
+        p_lower,
+        q_upper,
+        q_lower,
+        p_load,
+        q_load,
+        v_mag_min,
+        v_mag_max,
+        s_max,
+        reference_bus,
+        max_coeff)
+        return new(
+            N,
+            Nbr,
+            M,
+            C,
+            q,
+            Ψ,
+            Ψbr,
+            Φ,
+            Φbr,
+            p_upper,
+            p_lower,
+            q_upper,
+            q_lower,
+            p_load,
+            q_load,
+            v_mag_min,
+            v_mag_max,
+            s_max,
+            reference_bus,
+            max_coeff
+        )
+end
+end
+
+function quantize(p::PowerFlowProblem, bits::Int)
+
+        scale = if (bits > 0) 1 / (2^bits) else 0.0 end
+        Y = calc_admittance_matrix(data).matrix
+        Ψ = [] # Hermitian components of Y
+        Ψbr = [] # Hermitian components of Y (branchess)
+        Φ = [] # Skew-Hermitian components of Y
+        Φbr = [] # Skew-Hermitian components of Y
+        p_upper = []
+        p_lower = []
+        q_upper = []
+        q_lower = []
+        p_load = []
+        q_load = []
+        v_mag_min = []
+        v_mag_max = []
+        s_max = []
+        reference_bus = p.reference_bus
+        N = size(Y)[1]
+        q = zeros(N)
+        C = zeros(N)
+        M = []
+        Nbr = length(p.Φbr)
+        for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
+            p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
+            push!(Ψ, p.max_coeff * quantize.(Ψⱼ / p.max_coeff , scale))
+            push!(Φ, p.max_coeff * quantize.(Φⱼ / p.max_coeff , scale))
+            
+            push!(p_upper, if pmax < 1e8 p.max_coeff * quantize(pmax / p.max_coeff , scale) else 1e10 end)
+            push!(p_lower, if pmin > -1e8 p.max_coeff * quantize(pmin / p.max_coeff , scale) else -1e10 end)
+            push!(q_upper, if qmax < 1e8 p.max_coeff * quantize(qmax / p.max_coeff , scale) else 1e10 end)
+            push!(q_lower, if qmin > -1e8 p.max_coeff * quantize(qmin / p.max_coeff , scale) else -1e10 end)
+            push!(p_load, p.max_coeff * quantize(pd / p.max_coeff , scale))
+            push!(q_load, p.max_coeff * quantize(qd / p.max_coeff , scale))
+            push!(v_mag_min, p.max_coeff * quantize(vmin / p.max_coeff , scale))
+            push!(v_mag_max, p.max_coeff * quantize(vmax / p.max_coeff, scale))
+            push!(M, p.max_coeff * quantize.(Mⱼ / p.max_coeff, scale))
+        end
+        return PowerFlowProblem(
+            N,
+            Nbr,
+            M,
+            C,
+            q,
+            Ψ,
+            Ψbr,
+            Φ,
+            Φbr,
+            p_upper,
+            p_lower,
+            q_upper,
+            q_lower,
+            p_load,
+            q_load,
+            v_mag_min,
+            v_mag_max,
+            s_max,
+            reference_bus, 
+            1.0
+        )
+end
+
+function get_model(p::PowerFlowProblem)
+    model = Model(Ipopt.Optimizer)
+    @variable(model, V[1:2p.n])
+    for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
+        p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
+
+        p_j = V' * Ψⱼ * V
+        q_j = V' * Φⱼ * V
+        mag_j = V' * Mⱼ * V
+        @constraint(model, pmin <= (pd + p_j) <= pmax )
+        @constraint(model, qmin <= (qd + q_j) <= qmax )
+        # @constraint(model, vmin <= mag_j <= vmax )
+    end
+    # @constraint(model, V[p.n+p.reference_bus] == 0 )
+    @objective(model, MIN_SENSE, 0)
+    return model
 end
 
 function calc_power_gradient(p::PowerFlowProblem,
@@ -467,13 +622,19 @@ function calc_power_gradient(p::PowerFlowProblem,
         q_j = V' * Φⱼ * V
         mag_j = V[j]^2 + V[j+n]^2
         # $$ \frac{}{} $$
-        dV .-=  (2 * quad_cost * (p_j + pd) .*(Ψⱼ + Ψⱼ') + 2 *lin_cost .* (Ψⱼ + Ψⱼ') + 
+        dV .-=  (#2 * quad_cost * (p_j + pd) .*(Ψⱼ + Ψⱼ') + lin_cost .* (Ψⱼ + Ψⱼ') + 
                     (λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
                     (γᵘ[j]-γˡ[j]) * (Φⱼ +  Φⱼ') + 
                     2(μᵘ[j]-μˡ[j]) * Mⱼ) * V
-        # dV .-= 2 * ((λᵘ[j]-λˡ[j]) * Ψⱼ + 
-        #             (γᵘ[j]-γˡ[j]) * Φⱼ + 
-        #             (μᵘ[j]-μˡ[j]) * Mⱼ) * V
+        # dV .-= ((λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
+                #    (γᵘ[j]-γˡ[j]) * (Φⱼ + Φⱼ') + 
+                    # (μᵘ[j]-μˡ[j]) * (Mⱼ + Mⱼ')) * V
+        # dV[j] -= 2(#(λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
+                    #   (γᵘ[j]-γˡ[j]) * (Φⱼ + Φⱼ') + 
+                    # (μᵘ[j]-μˡ[j])) * V[j]
+        # dV[j+n] -= 2(#(λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
+                    #   (γᵘ[j]-γˡ[j]) * (Φⱼ + Φⱼ') + 
+                    # (μᵘ[j]-μˡ[j])) * V[j+n]
         dλˡ[j] = pmin - pd - p_j
         dλᵘ[j] = pd + p_j - pmax
         dγˡ[j] = qmin - qd - q_j
@@ -484,7 +645,7 @@ function calc_power_gradient(p::PowerFlowProblem,
     for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
         p_br_j = V' * Ψⱼ * V
         q_br_j = V' * Φⱼ * V
-        dV .-=  2ν[j].*(p_br_j*(Ψⱼ + Ψⱼ') + q_br_j * (Φⱼ +  Φⱼ')) * V
+        # dV .-=  2ν[j].*(p_br_j*(Ψⱼ + Ψⱼ') + q_br_j * (Φⱼ +  Φⱼ')) * V
         dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
     end
     dλˡ .*= convert.(Float64, max.((dλˡ .> 0.), λˡ .> 0.))
@@ -530,20 +691,22 @@ function eval_constraints(p::PowerFlowProblem, V::Vector{Float64})
     for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
         p_br_j = V' * Ψⱼ * V
         q_br_j = V' * Φⱼ * V
-        dν[j] = p_br_j^2 + p_br_j^2 - sⱼ
+        # dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
     end
     return vcat(dλᵘ, dλˡ, dγᵘ, dγˡ, dμᵘ, dμˡ, dν)
 end
 
 function solve_pddyn(
-    problem::PowerFlowProblem;
-    tstop::Float64 = 200000.0,
+    p::PowerFlowProblem;
+    tstop::Float64 = 200.0,
     τ::Float64 = 1e-5,
     verbose::Bool = true,
     log_freq::Int = 10_000,
+    bits::Int = 0,
 )
     printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
     printf(x::Int) = Printf.@sprintf("%6d", x)
+    problem = quantize(p, bits)
     n = problem.n
     function grad(dx, x, p, t)
         fill!(dx, 0)
@@ -554,33 +717,35 @@ function solve_pddyn(
     x = rand(8n + problem.nbr)
     # x[1:2n] = [1.1000000050616032, 1.0864554011184095, 1.0773745270552761, 4.6790506294074145e-35, 0.17208914221302823, -0.22195526495444665]
     x[2n+1:end] .= 0
-    println(eval_objective(problem, x[1:2n]))
     result = Nothing
     for i in 1:1
         τ_stop = tstop / 1
         odeproblem = ODEProblem(grad, x, (0.0, τ_stop))
         result = solve(odeproblem, TRBDF2(), save_everystep=true);
         fvals = []
-        for x in result.u
-            testvec = eval_constraints(problem, x[1:2n])
-            comp = testvec .* x[2n+1:end]
+        fvals_fake = []
+        tvals = []
+        for (t, x) in zip(result.t, result.u)
             # print(testvec)
-            eval = eval_objective(problem, x[1:2n])
-            println(eval)
-            println(x[1:2n])
-            push!(fvals, eval)
+            eval = maximum(eval_constraints(p, x[1:2n]))#eval_objective(problem, x[1:2n])
+            push!(fvals, max(maximum(eval_constraints(p, x[1:2n])), 1e-10))
+            push!(fvals_fake, max(maximum(eval_constraints(problem, x[1:2n])), 1e-10))
+            push!(tvals, t)
             # logs = printf.((i * τ_stop, eval_objective(problem, x[1:2n]), max(testvec...), norm(comp)))
             # println(testvec .* x[n+1:end])
             # println(join(logs, "\t"))
             # plot!()
         end
-        pltval = plot(fvals)
+        # pltval = plot(tvals, fvals_fake, yscale=:log10,ylabel="Infeasibility", xlabel="Time")
+        pltval = plot([tvals, tvals], [fvals, fvals_fake], yscale=:log10,ylabel="Infeasibility", xlabel="Time")
+        # ylims!(1e-10, 1e+2)
         display(pltval)
         x = result.u[end]
         testvec = eval_constraints(problem, x[1:2n])
         println(x)
         println(testvec)
         
+    println(fvals[end])
     end
     # x = rand(8n)
     # k = 0
@@ -609,5 +774,6 @@ function solve_pddyn(
     γˡ = x[5n+1:6n]
     μᵘ = x[6n+1:7n]
     μˡ = x[7n+1:8n]
-    return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ
+    ν = x[8n+1:end]
+    return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ,ν
 end

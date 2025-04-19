@@ -89,7 +89,9 @@ function max_coeff(f::MOI.ScalarQuadraticFunction{Float64})
     end
     return maxfound
 end
-
+function max_coeff(::MOI.VariableIndex)
+    return 1.0
+end
 mutable struct QPBlockData{Float64}
     objective::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}}
     objective_function_type::_FunctionType
@@ -118,6 +120,8 @@ mutable struct QPBlockData{Float64}
             1.
         )
     end
+
+
 end
 
 function MOI.empty!(block::QPBlockData{Float64})
@@ -223,6 +227,20 @@ function eval_dense_gradient(
     return
 end
 
+function eval_dense_gradient(
+    ∇f::Vector{Float64},
+    f::MOI.ScalarAffineFunction{Float64},
+    x::Vector{ForwardDiff.Dual{ForwardDiff.Tag{DiffEqBase.OrdinaryDiffEqTag, Float64}, Float64, 1}},
+    p::Dict{Int64,Float64},
+)::Nothing
+    for term in f.terms
+        if !_is_parameter(term.variable)
+            ∇f[term.variable.value] += term.coefficient
+        end
+    end
+   
+    return
+end
 function normalize(block::QPBlockData) 
     block.norm_constant = max_coeff(block.objective)
     for c in block.constraints

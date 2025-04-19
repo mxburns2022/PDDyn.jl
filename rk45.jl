@@ -34,6 +34,7 @@ function axpy!(α, x::AbstractArray, y::AbstractArray, range::UnitRange{Int64})
     return y
 end
 
+
 function rks_step!(integrator::RK45Integrator, state::Vector{Float64}, gradient_oracle::Function, time::Float64, ranges::Vector{UnitRange{Int64}})
     η = integrator.stepsize
     gradient_oracle(integrator.scratch[1], state, time)
@@ -48,3 +49,15 @@ function rks_step!(integrator::RK45Integrator, state::Vector{Float64}, gradient_
     end
 end
 
+function rks_step!(integrator::RK45Integrator, state::Vector{Float64}, gradient_oracle::Function, time::Float64, lbounds::Vector{Float64},ubounds::Vector{Float64} )
+    η = integrator.stepsize
+    gradient_oracle(integrator.scratch[1], state, time)
+    gradient_oracle(integrator.scratch[2], state + 0.5 * η * integrator.scratch[1], time + 0.5 * η)
+    gradient_oracle(integrator.scratch[3], state + 0.5 * η * integrator.scratch[2], time + 0.5 * η)
+    gradient_oracle(integrator.scratch[4], state + η * integrator.scratch[4], time + η)
+    LinearAlgebra.axpy!(1.0, integrator.scratch[4], integrator.scratch[1])
+    LinearAlgebra.axpy!(2.0, integrator.scratch[3], integrator.scratch[1])
+    LinearAlgebra.axpy!(2.0, integrator.scratch[2], integrator.scratch[1])
+    LinearAlgebra.axpy!(η / 6.0, integrator.scratch[1], state)
+    state .= min.(max.(lbounds, state), ubounds)
+end
