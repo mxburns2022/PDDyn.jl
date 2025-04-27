@@ -261,7 +261,7 @@ function convert_to_format(src::MOI.ModelLike)
             MOI.add_constraint(qpblock, func, set)
         end
     end
-
+    # max_value = max(qpblock.
     return qpblock, variable_lbounds, variable_ubounds, N
 end
 

@@ -14,12 +14,7 @@ include("rk45.jl")
 # import Printf
 
 
-function quantize(x::Float64, step::Float64)
-    if step == 0
-        return x
-    end
-    return round(x / step) * step
-end
+
 
 function to_moi(x::Vector{MOI.VariableIndex}, Q::Matrix{Float64}, c::Vector{Float64}, b::Float64)
     quad_terms = MOI.ScalarQuadraticTerm{Float64}[]
@@ -92,10 +87,15 @@ function solve_pddyn(
     verbose::Bool = true,
     log_freq::Int = 1000,
     post_sample::Bool = false,
+    delay::Float64 = 0.0,
     target::Union{QPBlockData{Float64}, Type{Nothing}} = Nothing
 )
     printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
     printf(x::Int) = Printf.@sprintf("%6d", x)
+    # target_problem = 
+    if target == Nothing
+        target = problem
+    end
     # Implement primal-dual dynamics using the differential equation solver
     m = size(problem.constraints)[1]
     # n = problem.parameters
@@ -105,46 +105,71 @@ function solve_pddyn(
     # copyto!(primal_dual_system, primal_dual_inds, A', CartesianIndices(A'))
     # Projected gradient descent on Lagrangian
     #       L(x, \lambda) = 
+    print(lbounds)
     inequality_indices = Int[]
     for i in n+1:n+m
         if lbounds[i] == 0.0
             push!(inequality_indices, i)
         end
     end
-    function grad(dx, x, t)
+    println(inequality_indices)
+    function condition(u, t, integrator)
+        true
+    end
+    
+    function affect!(integrator)
+
+        integrator.u .= min.(max.(integrator.u, lbounds), ubounds)
+    end
+    callback = DiscreteCallback(condition, affect!)
+
+    function grad(dx, x,  t)
         dprimal = zeros(n)
         ddual = zeros(m)
         get_grad(problem, J, Jstructure, dprimal, ddual, x[1:n], x[n+1:end],lbounds)
         dx[1:n] .= -dprimal
         dx[n+1:end] .= ddual
-        ineq_grad = dx[indequality_indices] 
-        ineq_vars = x[indequality_indices] 
-        dx[indequality_indices] .*= convert.(Float64, max.((ineq_grad .> 0.), ineq_vars .> 0.))
-        # dλˡ .*= convert.(Float64, max.((dλˡ .> 0.), λˡ .> 0.))
-        # x.= min.(max.(x, lbounds), ubounds)
+        # ineq_grad = dx[inequality_indices] 
+        # ineq_vars = x[inequality_indices] 
+        x.= min.(max.(x, lbounds), ubounds)
+        # dx[inequality_indices] .*= convert.(Float64, max.((ineq_grad .> 0.), ineq_vars .> 0.))
         # x[n+1:end] .= max.(0., x[n+1:end])
+
     end
     time = 0.0
     x = randn(n+m)
     fill(x[m+1:end], 0)
+    x_copy = copy(x)
+    next_update_time = delay
     integrator = RK45Integrator(n+m, τ)
     time = 0.0
-    x = rand(n+m)
+    # x = rand(n+m)
     k = 0
     status = MOI.OTHER_ERROR
     prev_fval = Inf64
+    dx = zeros(size(x)...)
     while status == MOI.OTHER_ERROR && time < tstop
-        
-        # Take a single gradient step
-        rks_step!(integrator, x, grad, time)
-        # odeproblem = ODEProblem(grad, x, (0.0, tstop))
-        # result = solve(odeproblem, TRBDF2(), save_everystep=false);
+    # for i in 1:100
+        if delay < τ
+            # Take a single gradient step
+            rks_step!(integrator, x, grad, time)
+        else
+            fill!(dx, 0.0)
+            grad(dx, x_copy, time)
+            x += τ * (dx)
+            if time > next_update_time
+                x_copy = copy(x)
+                next_update_time += delay
+            end
+        end
+        # odeproblem = ODEProblem(grad, x, (0.0, tstop/100))
+        # result = solve(odeproblem, DP8(), save_everystep=false, callback=callback);
         x.= min.(max.(x, lbounds), ubounds)
-        x[n+1:end] .= max.(0., x[n+1:end])
+        # x = result.u[end]
         if time >= tstop
             status = MOI.ITERATION_LIMIT
         end
-        if (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
+        if  (mod(k, log_freq) == 0 || status != MOI.OTHER_ERROR)
             testvec = fill(0.0, m);
             MOI.eval_constraint(problem, testvec, x[1:n])
             comp = testvec .* x[n+1:end]
@@ -162,13 +187,14 @@ function solve_pddyn(
         time += τ   
         k += 1
         # break
+        # break
     end
     testvec = fill(0.0, m);
-    MOI.eval_constraint(problem, testvec, x[1:n])
-    objective = MOI.eval_objective(problem, x[1:n])
+    MOI.eval_constraint(target, testvec, x[1:n])
+    objective = MOI.eval_objective(target, x[1:n])
     status = MOI.LOCALLY_SOLVED
     constvec = zeros(m)
-    MOI.eval_constraint(problem, constvec, x[1:n])
+    MOI.eval_constraint(target, constvec, x[1:n])
     complementarity = norm(constvec .* x[n+1:m+n]) 
     primal_status = MOI.NO_SOLUTION
     dual_status = MOI.NO_SOLUTION
@@ -355,7 +381,7 @@ mutable struct PowerFlowProblem
         end
         print(bus_ids_inv)
         for j in 1:N
-            eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep(Eⱼ * Y);Φⱼ = to_real_rep(-im * Eⱼ * Y);
+            eⱼ = zeros(N); eⱼ[j] = 1; Eⱼ = diagm(eⱼ);Ψⱼ = to_real_rep( 0.5 * ((Eⱼ*Y)'+(Eⱼ*Y)));Φⱼ = to_real_rep(-im * 0.5 * ((Eⱼ*Y)'-(Eⱼ*Y)));
             push!(Ψ, Ψⱼ)
             push!(Φ, Φⱼ)
             bus_key = "$(bus_ids_inv[j])"
@@ -395,38 +421,50 @@ mutable struct PowerFlowProblem
             push!(M, sp.sparse([j, j+N, 2N], [j, j+N, 2N], [1, 1, 0.0]))
             
         end
-        ΨT = to_real_rep(Y);
-        ΦT = to_real_rep(Y);
+        Yh = 0.5 * (Y + Y');
+        Y_sk = -im * 0.5 * (Y' - Y);
         for (_, brdata) in pairs(data["branch"])
             srcnode = bus_ids[brdata["f_bus"]]
             destnode = bus_ids[brdata["t_bus"]]
             eᵢ = zeros(N); eᵢ[srcnode] = 1; Eᵢ = diagm(eᵢ);
             eⱼ = zeros(N); eⱼ[destnode] = 1; Eⱼ = diagm(eⱼ);
-            Ψⱼ = sp.spzeros(size(ΨT))
-            Φⱼ = sp.spzeros(size(ΦT))
-            # Ψⱼ = to_real_rep((Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
-            # Φⱼ = to_real_rep(-im * (Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ));
-            Ψⱼ[srcnode, srcnode] = ΨT[srcnode, srcnode]
-            Ψⱼ[srcnode+N, srcnode+N] = ΨT[srcnode+N, srcnode+N]
-            Ψⱼ[srcnode, destnode] = ΨT[srcnode, destnode]
-            Ψⱼ[destnode, srcnode] = ΨT[destnode, srcnode]
-            Ψⱼ[srcnode+N, destnode+N] = ΨT[srcnode+N, destnode+N]
-            Ψⱼ[destnode+N, srcnode+N] = ΨT[destnode+N, srcnode+N]
-            Ψⱼ[srcnode, destnode+N] = ΨT[srcnode, destnode+N]
-            Ψⱼ[destnode+N, srcnode] = ΨT[destnode+N, srcnode]
-            Ψⱼ[srcnode+N, destnode] = ΨT[srcnode+N, destnode]
-            Ψⱼ[destnode, srcnode+N] = ΨT[destnode, srcnode+N]
 
-            Φⱼ[srcnode, srcnode] = ΦT[srcnode, srcnode]
-            Φⱼ[srcnode+N, srcnode+N] = ΦT[srcnode+N, srcnode+N]
-            Φⱼ[srcnode, destnode] = ΦT[srcnode, destnode]
-            Φⱼ[destnode, srcnode] = ΦT[destnode, srcnode]
-            Φⱼ[srcnode+N, destnode+N] = ΦT[srcnode+N, destnode+N]
-            Φⱼ[destnode+N, srcnode+N] = ΦT[destnode+N, srcnode+N]
-            Φⱼ[srcnode, destnode+N] = ΦT[srcnode, destnode+N]
-            Φⱼ[destnode+N, srcnode] = ΦT[destnode+N, srcnode]
-            Φⱼ[srcnode+N, destnode] = ΦT[srcnode+N, destnode]
-            Φⱼ[destnode, srcnode+N] = ΦT[destnode, srcnode+N]
+            Yij_h = sp.spzeros(ComplexF64, size(Y))
+            Yij_h[srcnode, srcnode] =  -(Yh[srcnode, destnode])
+            Yij_h[srcnode, destnode] = -(Yh[srcnode, destnode])
+            # Yij_h[destnode, srcnode] = (Yh[srcnode,  destnode])
+
+            Yij_sk = sp.spzeros(ComplexF64, size(Y))
+            Yij_sk[srcnode, srcnode] =  -(Y_sk[srcnode, destnode])
+            Yij_sk[srcnode, destnode] = (Y_sk[srcnode, destnode])
+            # Yij[srcnode, destnode] = -Y[srcnode, destnode]
+            # Φⱼ = sp.spzeros(size(Y))
+            # Yij = (Eᵢ + Eⱼ) * Y * (Eᵢ + Eⱼ)
+            # Yij[srcnode, srcnode] = Y[srcnode, srcnode]
+            # Yij[destnode, destnode] = Y[destnode, destnode]
+            Ψⱼ = to_real_rep(Yij_h);
+            Φⱼ = to_real_rep(Yij_sk);
+            # Ψⱼ[srcnode, srcnode] = ΨT[srcnode, srcnode]
+            # Ψⱼ[srcnode+N, srcnode+N] = ΨT[srcnode+N, srcnode+N]
+            # Ψⱼ[srcnode, destnode] = ΨT[srcnode, destnode]
+            # Ψⱼ[destnode, srcnode] = ΨT[destnode, srcnode]
+            # Ψⱼ[srcnode+N, destnode+N] = ΨT[srcnode+N, destnode+N]
+            # Ψⱼ[destnode+N, srcnode+N] = ΨT[destnode+N, srcnode+N]
+            # Ψⱼ[srcnode, destnode+N] = ΨT[srcnode, destnode+N]
+            # Ψⱼ[destnode+N, srcnode] = ΨT[destnode+N, srcnode]
+            # Ψⱼ[srcnode+N, destnode] = ΨT[srcnode+N, destnode]
+            # Ψⱼ[destnode, srcnode+N] = ΨT[destnode, srcnode+N]
+
+            # Φⱼ[srcnode, srcnode] = ΦT[srcnode, srcnode]
+            # Φⱼ[srcnode+N, srcnode+N] = ΦT[srcnode+N, srcnode+N]
+            # Φⱼ[srcnode, destnode] = ΦT[srcnode, destnode]
+            # Φⱼ[destnode, srcnode] = ΦT[destnode, srcnode]
+            # Φⱼ[srcnode+N, destnode+N] = ΦT[srcnode+N, destnode+N]
+            # Φⱼ[destnode+N, srcnode+N] = ΦT[destnode+N, srcnode+N]
+            # Φⱼ[srcnode, destnode+N] = ΦT[srcnode, destnode+N]
+            # Φⱼ[destnode+N, srcnode] = ΦT[destnode+N, srcnode]
+            # Φⱼ[srcnode+N, destnode] = ΦT[srcnode+N, destnode]
+            # Φⱼ[destnode, srcnode+N] = ΦT[destnode, srcnode+N]
 
 
             # Ψⱼ[destnode, destnode] = 0
@@ -434,7 +472,7 @@ mutable struct PowerFlowProblem
             # Ψⱼ[srcnode, srcnode] = 0
             push!(Ψbr, Ψⱼ)
             push!(Φbr, Φⱼ)
-            push!(s_max, brdata["rate_a"]^2 / norm^2)
+            push!(s_max, brdata["rate_a"]^2)
         end
         function maxval(y)
             if abs(y) > 1e8
@@ -529,27 +567,31 @@ function quantize(p::PowerFlowProblem, bits::Int)
         q_load = []
         v_mag_min = []
         v_mag_max = []
-        s_max = []
+        s_max = quantize.(p.s_max, scale, p.max_coeff, false)
         reference_bus = p.reference_bus
         N = size(Y)[1]
-        q = zeros(N)
-        C = zeros(N)
+        q = quantize.(p.q, scale, p.max_coeff, false)
+        C = quantize.(p.C, scale, p.max_coeff, false)
         M = []
         Nbr = length(p.Φbr)
         for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
             p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
-            push!(Ψ, p.max_coeff * quantize.(Ψⱼ / p.max_coeff , scale))
-            push!(Φ, p.max_coeff * quantize.(Φⱼ / p.max_coeff , scale))
+            push!(Ψ, quantize.(Ψⱼ, scale, p.max_coeff, false))
+            push!(Φ, quantize.(Φⱼ, scale, p.max_coeff, false))
             
-            push!(p_upper, if pmax < 1e8 p.max_coeff * quantize(pmax / p.max_coeff , scale) else 1e10 end)
-            push!(p_lower, if pmin > -1e8 p.max_coeff * quantize(pmin / p.max_coeff , scale) else -1e10 end)
-            push!(q_upper, if qmax < 1e8 p.max_coeff * quantize(qmax / p.max_coeff , scale) else 1e10 end)
-            push!(q_lower, if qmin > -1e8 p.max_coeff * quantize(qmin / p.max_coeff , scale) else -1e10 end)
-            push!(p_load, p.max_coeff * quantize(pd / p.max_coeff , scale))
-            push!(q_load, p.max_coeff * quantize(qd / p.max_coeff , scale))
-            push!(v_mag_min, p.max_coeff * quantize(vmin / p.max_coeff , scale))
-            push!(v_mag_max, p.max_coeff * quantize(vmax / p.max_coeff, scale))
-            push!(M, p.max_coeff * quantize.(Mⱼ / p.max_coeff, scale))
+            push!(p_upper, if pmax < 1e8 quantize(pmax, scale, p.max_coeff, false) else 1e10 end)
+            push!(p_lower, if pmin > -1e8 quantize(pmin, scale, p.max_coeff, false) else -1e10 end)
+            push!(q_upper, if qmax < 1e8 quantize(qmax, scale, p.max_coeff, false) else 1e10 end)
+            push!(q_lower, if qmin > -1e8 quantize(qmin, scale, p.max_coeff, false) else -1e10 end)
+            push!(p_load, quantize(pd, scale, p.max_coeff, false))
+            push!(q_load, quantize(qd, scale, p.max_coeff, false))
+            push!(v_mag_min, quantize(vmin, scale, p.max_coeff, false))
+            push!(v_mag_max, quantize(vmax, scale,p.max_coeff, false))
+            push!(M, quantize.(Mⱼ, scale,p.max_coeff, false))
+        end
+        for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
+            push!(Ψbr, quantize.(Ψⱼ, scale, p.max_coeff, false))
+            push!(Φbr, quantize.(Φⱼ, scale, p.max_coeff, false))
         end
         return PowerFlowProblem(
             N,
@@ -622,10 +664,10 @@ function calc_power_gradient(p::PowerFlowProblem,
         q_j = V' * Φⱼ * V
         mag_j = V[j]^2 + V[j+n]^2
         # $$ \frac{}{} $$
-        dV .-=  (#2 * quad_cost * (p_j + pd) .*(Ψⱼ + Ψⱼ') + lin_cost .* (Ψⱼ + Ψⱼ') + 
-                    (λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
-                    (γᵘ[j]-γˡ[j]) * (Φⱼ +  Φⱼ') + 
-                    2(μᵘ[j]-μˡ[j]) * Mⱼ) * V
+        dV .-=  2(2 * quad_cost * (p_j + pd) .*(Ψⱼ) + lin_cost .* (Ψⱼ) + 
+                    (λᵘ[j]-λˡ[j]) * (Ψⱼ) + 
+                    (γᵘ[j]-γˡ[j]) * (Φⱼ) + 
+                    (μᵘ[j]-μˡ[j]) * Mⱼ) * V
         # dV .-= ((λᵘ[j]-λˡ[j]) * (Ψⱼ + Ψⱼ') + 
                 #    (γᵘ[j]-γˡ[j]) * (Φⱼ + Φⱼ') + 
                     # (μᵘ[j]-μˡ[j]) * (Mⱼ + Mⱼ')) * V
@@ -642,12 +684,12 @@ function calc_power_gradient(p::PowerFlowProblem,
         dμˡ[j] = vmin - mag_j
         dμᵘ[j] = mag_j - vmax
     end
-    for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
-        p_br_j = V' * Ψⱼ * V
-        q_br_j = V' * Φⱼ * V
-        # dV .-=  2ν[j].*(p_br_j*(Ψⱼ + Ψⱼ') + q_br_j * (Φⱼ +  Φⱼ')) * V
-        dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
-    end
+    # for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
+    #     p_br_j = V' * Ψⱼ * V
+    #     q_br_j = V' * Φⱼ * V
+    #     # dV .-=  4ν[j].*(p_br_j*(Ψⱼ) + q_br_j * (Φⱼ)) * V
+    #     # dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
+    # end
     dλˡ .*= convert.(Float64, max.((dλˡ .> 0.), λˡ .> 0.))
     dγˡ .*= convert.(Float64, max.((dγˡ .> 0.), γˡ .> 0.))
     dμˡ .*= convert.(Float64, max.((dμˡ .> 0.), μˡ .> 0.))
@@ -665,6 +707,7 @@ function eval_objective(p::PowerFlowProblem, V::Vector{Float64})
         lin_cost = p.q[j]
         power_value = V' * p.Ψ[j] * V + p.p_load[j]
         result += quad_cost * power_value^2 + lin_cost * power_value
+        println("$(quad_cost), $(lin_cost), $(power_value)")
     end
     return result
 end
@@ -691,14 +734,14 @@ function eval_constraints(p::PowerFlowProblem, V::Vector{Float64})
     for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
         p_br_j = V' * Ψⱼ * V
         q_br_j = V' * Φⱼ * V
-        # dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
+        dν[j] = p_br_j^2 + q_br_j^2 - sⱼ
     end
     return vcat(dλᵘ, dλˡ, dγᵘ, dγˡ, dμᵘ, dμˡ, dν)
 end
 
 function solve_pddyn(
-    p::PowerFlowProblem;
-    tstop::Float64 = 200.0,
+    problem::PowerFlowProblem;
+    tstop::Float64 = 30000.0,
     τ::Float64 = 1e-5,
     verbose::Bool = true,
     log_freq::Int = 10_000,
@@ -706,7 +749,7 @@ function solve_pddyn(
 )
     printf(x::Float64) = Printf.@sprintf("% 1.6e", x)
     printf(x::Int) = Printf.@sprintf("%6d", x)
-    problem = quantize(p, bits)
+    # problem = quantize(p, bits)
     n = problem.n
     function grad(dx, x, p, t)
         fill!(dx, 0)
@@ -743,10 +786,12 @@ function solve_pddyn(
         x = result.u[end]
         testvec = eval_constraints(problem, x[1:2n])
         println(x)
-        println(testvec)
+        println("Constraints: ", maximum(testvec))
+        println("Objective: ", eval_objective(problem, x[1:2n]))
         
     println(fvals[end])
     end
+
     # x = rand(8n)
     # k = 0
     
