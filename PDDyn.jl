@@ -779,9 +779,7 @@ function solve_pddyn(
             # println(join(logs, "\t"))
             # plot!()
         end
-        # pltval = plot(tvals, fvals_fake, yscale=:log10,ylabel="Infeasibility", xlabel="Time")
         pltval = plot([tvals, tvals], [fvals, fvals_fake], yscale=:log10,ylabel="Infeasibility", xlabel="Time")
-        # ylims!(1e-10, 1e+2)
         display(pltval)
         x = result.u[end]
         testvec = eval_constraints(problem, x[1:2n])
@@ -789,7 +787,7 @@ function solve_pddyn(
         println("Constraints: ", maximum(testvec))
         println("Objective: ", eval_objective(problem, x[1:2n]))
         
-    println(fvals[end])
+    # println(fvals[end])
     end
 
     # x = rand(8n)
@@ -820,5 +818,5 @@ function solve_pddyn(
     μᵘ = x[6n+1:7n]
     μˡ = x[7n+1:8n]
     ν = x[8n+1:end]
-    return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ,ν
+    return V, λᵘ, λˡ, γᵘ, γˡ, μᵘ, μˡ,ν,result
 end
