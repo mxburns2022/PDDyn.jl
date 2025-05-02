@@ -22,26 +22,30 @@ end
 # model = Model(Ipopt.Optimizer)
 # @variable(model, V[i=1:2p.n], start=rnginit(i))
 result = optimize_model!(model, optimizer=Ipopt.Optimizer)
-P = zeros(2N) # vcat([result["solution"]["gen"]["$(i)"]["pg"] for i in 1:3], [result["solution"]["gen"]["$(i)"]["qg"] for i in 1:3])
-pd_vec = solve_pddyn(p)
-results_pd = pd_vec[end]
-complementarity = [maximum(u[2N+1:end-p.nbr].*eval_constraints(p, u[1:2N])[1:end-p.nbr]) for u in results_pd.u]
-constraint_vals = [maximum(eval_constraints(p, u[1:2N])) for u in results_pd.u]
-fvals = [eval_objective(p, u[1:2N]) for u in results_pd.u]
-df = DataFrame(
-  merge(
-    Dict(
-      "t" => results_pd.t,
-      "objective" => [eval_objective(p, u[1:2N]) for u in results_pd.u],
-      "primal_feasibility" => [maximum(eval_constraints(p, u[1:2N])) for u in results_pd.u],
-      "dual_feasibility" => [norm(u[2N+1:end].*eval_constraints(p, u[1:2N])) for u in results_pd.u],
-    ),
-    Dict(
-      ["v$(i)" => [u[i] for u in results_pd.u] for i in 1:2N]...
+for b in [0, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+  for rd in [true, false]
+    p_bits = quantize(p, b, rd)
+    pd_vec = solve_pddyn(p_bits;tstop=50000.)
+    results_pd = pd_vec[end]
+    complementarity = [maximum(u[2N+1:end-p.nbr].*eval_constraints(p, u[1:2N])[1:end-p.nbr]) for u in results_pd.u]
+    constraint_vals = [maximum(eval_constraints(p, u[1:2N])) for u in results_pd.u]
+    fvals = [eval_objective(p, u[1:2N]) for u in results_pd.u]
+    df = DataFrame(
+      merge(
+        Dict(
+          "t" => results_pd.t,
+          "objective" => [eval_objective(p, u[1:2N]) for u in results_pd.u],
+          "primal_feasibility" => [maximum(eval_constraints(p, u[1:2N])) for u in results_pd.u],
+          "dual_feasibility" => [norm(u[2N+1:end].*eval_constraints(p, u[1:2N])) for u in results_pd.u],
+        ),
+        Dict(
+          ["v$(i)" => [u[i] for u in results_pd.u] for i in 1:2N]...
+        )
+      )
     )
-  )
-)
-CSV.write("case$(N)_results.csv", df)
+    CSV.write("case_$(N)_bits_$(b)_$(rd)_results.csv", df)
+  end
+end
 # # V = results_pd[1]
 # # Pb = []
 # # for Φ_i in p.Ψ
