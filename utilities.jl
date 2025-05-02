@@ -12,6 +12,7 @@
 #     types, including their deletion, may be introduced in any minor or patch
 #     release of Ipopt.
 
+using ForwardDiff
 const _PARAMETER_OFFSET = 0x00f0000000000000
 
 _is_parameter(x::MOI.VariableIndex) = x.value >= _PARAMETER_OFFSET
@@ -70,6 +71,43 @@ function _bound_type_to_set(::Type{Float64}, k::_BoundType)
     end
 end
 
+function quantize(x::Float64, step::Float64, norm::Float64, randomize::Bool)
+    if step == 0 || x == 0
+        return x
+    end
+    max_noise = 0
+    if randomize
+        max_noise = randn() * step
+    end
+    return (round(x / norm / step) * step + max_noise) * norm 
+    # return (round(x / norm / step) * step) * norm 
+end
+
+function quantize(f::MOI.ScalarAffineTerm, step::Float64, norm::Float64, randomize::Bool)
+    return MOI.ScalarAffineTerm(quantize(f.coefficient, step, norm, randomize), f.variable)
+end
+function quantize(f::MOI.ScalarQuadraticTerm, step::Float64, norm::Float64, randomize::Bool)
+    return MOI.ScalarQuadraticTerm(quantize(f.coefficient, step, norm, randomize), f.variable_1, f.variable_2)
+end
+function quantize(f::MOI.ScalarAffineFunction, step::Float64, norm::Float64, randomize::Bool)
+    return MOI.ScalarAffineFunction(
+        quantize.(f.terms, step, norm, randomize), 
+        quantize(f.constant, step, norm, randomize)) 
+end
+
+function quantize(f::MOI.ScalarQuadraticFunction, step::Float64, norm::Float64, randomize::Bool)
+    return MOI.ScalarQuadraticFunction(
+        quantize.(f.quadratic_terms, step, norm, randomize), 
+        quantize.(f.affine_terms, step, norm, randomize), 
+        quantize(f.constant, step, norm, randomize)) 
+end
+
+function quantize(f::MOI.VariableIndex, step::Float64, norm::Float64, randomize::Bool)
+    return f
+end
+
+
+
 function max_coeff(f::MOI.ScalarAffineFunction{Float64})
     maxfound = abs(f.constant)
     for t in f.terms
@@ -89,6 +127,9 @@ function max_coeff(f::MOI.ScalarQuadraticFunction{Float64})
     return maxfound
 end
 
+function max_coeff(::MOI.VariableIndex)
+    return 1.0
+end
 mutable struct QPBlockData{Float64}
     objective::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}}
     objective_function_type::_FunctionType
@@ -118,6 +159,26 @@ mutable struct QPBlockData{Float64}
         )
     end
 end
+function quantize(b::QPBlockData{Float64}, bits, randomize)
+    scale = 0.
+    if bits > 0
+        scale = 1 / (2^bits)
+    end
+    maxcoeff = max(max_coeff(b.objective), maximum(max_coeff.(b.constraints)))
+    new_b = QPBlockData{Float64}()
+    new_b.objective_function_type = b.objective_function_type
+    new_b.g_L = b.g_L
+    new_b.g_U = b.g_U
+    new_b.mult_g = b.mult_g
+    new_b.function_type = b.function_type
+    new_b.bound_type = b.bound_type
+    new_b.norm_constant = b.norm_constant
+    new_b.parameters = b.parameters
+
+    new_b.objective = quantize(b.objective, scale, maxcoeff, randomize)
+    new_b.constraints = quantize.(b.constraints, scale, maxcoeff, randomize)
+    return new_b
+end
 
 function MOI.empty!(block::QPBlockData{Float64})
     empty!(block.constraints)
@@ -143,20 +204,20 @@ end
 
 function eval_function(
     f::MOI.ScalarQuadraticFunction{Float64},
-    x::Vector{Float64},
+    x::AbstractVector,
     p::Dict{Int64,Float64},
 )::Float64
     y = f.constant
     for term in f.affine_terms
-        y += term.coefficient * _value(term.variable, x, p)
+        y += ForwardDiff.value(term.coefficient * _value(term.variable, x, p))
     end
     for term in f.quadratic_terms
         v1 = _value(term.variable_1, x, p)
         v2 = _value(term.variable_2, x, p)
         if term.variable_1 == term.variable_2
-            y += term.coefficient * v1 * v2 / 2
+            y += ForwardDiff.value(term.coefficient * v1 * v2 / 2)
         else
-            y += term.coefficient * v1 * v2
+            y += ForwardDiff.value(term.coefficient * v1 * v2)
         end
     end
     return y
@@ -164,12 +225,12 @@ end
 
 function eval_function(
     f::MOI.ScalarAffineFunction{Float64},
-    x::Vector{Float64},
+    x::AbstractVector,
     p::Dict{Int64,Float64},
 )::Float64
     y = f.constant
     for term in f.terms
-        y += term.coefficient * _value(term.variable, x, p)
+        y += ForwardDiff.value(term.coefficient * _value(term.variable, x, p))
     end
     return y
 end
@@ -198,6 +259,44 @@ function eval_dense_gradient(
     return
 end
 
+function eval_dense_gradient(
+    ∇f::Vector{Float64},
+    f::MOI.ScalarQuadraticFunction{Float64},
+    x::Vector{ForwardDiff.Dual{ForwardDiff.Tag{DiffEqBase.OrdinaryDiffEqTag, Float64}, Float64, 1}},
+    p::Dict{Int64,Float64},
+)::Nothing
+    for term in f.affine_terms
+        if !_is_parameter(term.variable)
+            ∇f[term.variable.value] += term.coefficient
+        end
+    end
+    for term in f.quadratic_terms
+        if !_is_parameter(term.variable_1)
+            v = ForwardDiff.value(_value(term.variable_2, x, p))
+            ∇f[term.variable_1.value] += term.coefficient * v
+        end
+        if term.variable_1 != term.variable_2 && !_is_parameter(term.variable_2)
+            v = ForwardDiff.value(_value(term.variable_1, x, p))
+            ∇f[term.variable_2.value] += term.coefficient * v
+        end
+    end
+    return
+end
+
+function eval_dense_gradient(
+    ∇f::Vector{Float64},
+    f::MOI.ScalarAffineFunction{Float64},
+    x::Vector{ForwardDiff.Dual{ForwardDiff.Tag{DiffEqBase.OrdinaryDiffEqTag, Float64}, Float64, 1}},
+    p::Dict{Int64,Float64},
+)::Nothing
+    for term in f.terms
+        if !_is_parameter(term.variable)
+            ∇f[term.variable.value] += term.coefficient
+        end
+    end
+   
+    return
+end
 function normalize(block::QPBlockData) 
     block.norm_constant = max_coeff(block.objective)
     for c in block.constraints
@@ -206,7 +305,7 @@ function normalize(block::QPBlockData)
 end
 
 function eval_dense_gradient(
-    ∇f::Vector{Float64},
+    ∇f::Vector,
     f::MOI.ScalarAffineFunction{Float64},
     x::Vector{Float64},
     p::Dict{Int64,Float64},
@@ -250,9 +349,9 @@ function append_sparse_gradient_structure!(f::MOI.ScalarAffineFunction, J, row)
 end
 
 function  eval_sparse_gradient(
-    ∇f::AbstractVector{Float64},
+    ∇f::AbstractVector,
     f::MOI.ScalarQuadraticFunction{Float64},
-    x::Vector{Float64},
+    x::Vector,
     p::Dict{Int64,Float64},
 )::Int
     i = 0
@@ -276,11 +375,38 @@ function  eval_sparse_gradient(
     end
     return i
 end
+function  eval_sparse_gradient(
+    ∇f::AbstractVector,
+    f::MOI.ScalarQuadraticFunction{Float64},
+    x::Vector{ForwardDiff.Dual{ForwardDiff.Tag{DiffEqBase.OrdinaryDiffEqTag, Float64}, Float64, 1}},
+    p::Dict{Int64,Float64},
+)::Int
+    i = 0
+    for term in f.affine_terms
+        if !_is_parameter(term.variable)
+            i += 1
+            ∇f[i] = term.coefficient
+        end
+    end
+    for term in f.quadratic_terms
+        if !_is_parameter(term.variable_1)
+            v = ForwardDiff.value(_value(term.variable_2, x, p))
+            i += 1
+            ∇f[i] = term.coefficient * v
+        end
+        if term.variable_1 != term.variable_2 && !_is_parameter(term.variable_2)
+            v = ForwardDiff.value(_value(term.variable_1, x, p))
+            i += 1
+            ∇f[i] = term.coefficient * v
+        end
+    end
+    return i
+end
 
 function eval_sparse_gradient(
-    ∇f::AbstractVector{Float64},
+    ∇f::AbstractVector,
     f::MOI.ScalarAffineFunction{Float64},
-    x::Vector{Float64},
+    x::Vector,
     p::Dict{Int64,Float64},
 )::Int
     i = 0
@@ -428,6 +554,60 @@ function MOI.add_constraint(
     push!(block.function_type, _function_info(f))
     return MOI.ConstraintIndex{typeof(f),typeof(s)}(length(block.bound_type))
 end
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    f::Union{MOI.ScalarAffineFunction{Float64},MOI.ScalarQuadraticFunction{Float64}},
+    s::MOI.Interval{Float64},
+)
+    s1 = MOI.GreaterThan{Float64}(s.lower)
+    s2 = MOI.LessThan{Float64}(s.upper)
+    c1=MOI.add_constraint(block, f, s1)
+    c2=MOI.add_constraint(block, f, s2)
+    return [c1, c2]
+end
+
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    v::MOI.VariableIndex,
+    s::MOI.GreaterThan{Float64},
+)
+    g = MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, v)], -s.lower)
+    push!(block.constraints, g)
+    push!(block.g_L, s.lower)
+    push!(block.g_U, Inf)
+    push!(block.mult_g, nothing)
+    push!(block.bound_type, _kBoundTypeLessThan)
+    push!(block.function_type, _function_info(v))
+    return MOI.ConstraintIndex{typeof(v),typeof(s)}(length(block.bound_type))
+end
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    v::MOI.VariableIndex,
+    s::MOI.LessThan{Float64},
+)
+    g = MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(-1.0, v)], s.upper)
+    push!(block.constraints, g)
+    push!(block.g_L, -Inf)
+    push!(block.g_U, s.upper)
+    push!(block.mult_g, nothing)
+    push!(block.bound_type, _kBoundTypeLessThan)
+    push!(block.function_type, _function_info(v))
+    return MOI.ConstraintIndex{typeof(v),typeof(s)}(length(block.bound_type))
+end
+function MOI.add_constraint(
+    block::QPBlockData{Float64},
+    v::MOI.VariableIndex,
+    s::MOI.EqualTo{Float64},
+)
+    g = MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, v)], -s.value)
+    push!(block.constraints, g)
+    push!(block.g_L, s.value)
+    push!(block.g_U, s.value)
+    push!(block.mult_g, nothing)
+    push!(block.bound_type, _kBoundTypeLessThan)
+    push!(block.function_type, _function_info(v))
+    return MOI.ConstraintIndex{typeof(v),typeof(s)}(length(block.bound_type))
+end
 
 function MOI.add_constraint(
     block::QPBlockData{Float64},
@@ -560,8 +740,8 @@ end
 
 function MOI.eval_objective_gradient(
     block::QPBlockData{Float64},
-    ∇f::AbstractVector{Float64},
-    x::AbstractVector{Float64},
+    ∇f::AbstractVector,
+    x::AbstractVector,
 )
     ∇f .= zero(Float64)
     eval_dense_gradient(∇f, block.objective, x, block.parameters)
@@ -570,8 +750,8 @@ end
 
 function MOI.eval_constraint(
     block::QPBlockData{Float64},
-    g::AbstractVector{Float64},
-    x::AbstractVector{Float64},
+    g::AbstractVector,
+    x::AbstractVector,
 )
     for (i, constraint) in enumerate(block.constraints)
         g[i] = eval_function(constraint, x, block.parameters)
@@ -590,7 +770,7 @@ end
 function MOI.eval_constraint_jacobian(
     block::QPBlockData{Float64},
     J::AbstractVector{Float64},
-    x::AbstractVector{Float64},
+    x::AbstractVector,
 )
     i = 1
     for constraint in block.constraints
@@ -599,6 +779,7 @@ function MOI.eval_constraint_jacobian(
     end
     return i
 end
+
 
 function MOI.hessian_lagrangian_structure(block::QPBlockData)
     H = Tuple{Int,Int}[]

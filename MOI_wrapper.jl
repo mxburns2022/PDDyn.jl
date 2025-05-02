@@ -51,7 +51,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
             MOI.OPTIMIZE_NOT_CALLED
         )
     end
-
+    
 end
 
 function Base.summary(io::IO, model::Optimizer)
@@ -149,8 +149,12 @@ function MOI.add_constraint(
     constraintset::Union{MOI.EqualTo{Float64}, MOI.LessThan{Float64}, MOI.GreaterThan{Float64}})
     v = cons.value
     _, l, u,_,_ = _set_info(constraintset)
-    model.variable_ubounds[v] = u
-    model.variable_lbounds[v] = l
+    if l > model.variable_lbounds[v] 
+        model.variable_lbounds[v] = l
+    end
+    if u < model.variable_ubounds[v] 
+        model.variable_ubounds[v] = u
+    end
 end
 function MOI.set(
         model::Optimizer, 
@@ -192,8 +196,74 @@ const CacheModel = MOI.Utilities.GenericModel{
         SetOfZeros{Float64}
     },
 }
+function MOI.set(model::Optimizer, ::MOI.ObjectiveSense, val::MOI.OptimizationSense)
+    if val == MOI.MAX_SENSE
+        model.qpblock.objective *= -1
+    end
+end
+function MOI.get(model::Optimizer, ::MOI.ObjectiveSense)
+    return MOI.MIN_SENSE
+end
 
+function convert_to_format(src::MOI.ModelLike)
+    list_of_indices = MOI.get(src, MOI.ListOfVariableIndices())
+    variable_lbounds = Float64[]
+    variable_ubounds = Float64[]
+    qpblock = QPBlockData{Float64}()
+    N = MOI.get(src, MOI.NumberOfVariables())
+    resize!(variable_lbounds, N)
+    fill!(variable_lbounds, -Inf)
+    resize!(variable_ubounds, N)
+    fill!(variable_ubounds, Inf)
+    # println("N", N)
+    silent = false;
+    ftype = MOI.get(src, MOI.ObjectiveFunctionType())
+    objfunc = MOI.get(src, MOI.ObjectiveFunction{ftype}())
 
+    maxterm = max_coeff(objfunc)
+    qterms = MOI.ScalarQuadraticTerm{Float64}[]
+    for t in list_of_indices
+        qterm_st = MOI.ScalarQuadraticTerm{Float64}(2, t, t)
+        push!(qterms, qterm_st)
+
+    end
+    dummylin = MOI.ScalarAffineTerm(0.0, list_of_indices[1])
+    objfunc_type = typeof(objfunc)
+    # if objfunc_type == MOI.ScalarAffineFunction{Float64}
+        
+    # end
+    # objfunc = objfunc + MOI.ScalarQuadraticFunction(qterms[3:3], [dummylin], 0.0)
+    MOI.set(qpblock, MOI.ObjectiveFunction{ftype}(), objfunc)
+    for (F, S) in MOI.get(src, MOI.ListOfConstraintTypesPresent())
+        lbound_value = 0.0
+        if S <: MOI.EqualTo{Float64}
+            lbound_value = -Inf 
+        end
+        for ci in MOI.get(src, MOI.ListOfConstraintIndices{F, S}())
+            if !(F <: MOI.VariableIndex)
+                push!(variable_lbounds, lbound_value)
+                push!(variable_ubounds, Inf)
+            else
+                cons = MOI.get(src, MOI.ConstraintFunction(), ci)
+                constraintset = MOI.get(src, MOI.ConstraintSet(), ci)
+                v = cons.value
+                _, l, u,_,_ = _set_info(constraintset)
+                if l > variable_lbounds[v] 
+                    variable_lbounds[v] = l
+                end
+                if u < variable_ubounds[v] 
+                    variable_ubounds[v] = u
+                end
+                continue
+            end
+            func = MOI.get(src, MOI.ConstraintFunction(), ci)
+            set = MOI.get(src, MOI.ConstraintSet(), ci)
+            MOI.add_constraint(qpblock, func, set)
+        end
+    end
+    # max_value = max(qpblock.
+    return qpblock, variable_lbounds, variable_ubounds, N
+end
 
 function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike) 
     list_of_indices = MOI.get(src, MOI.ListOfVariableIndices())
@@ -223,6 +293,7 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
     end
     dummylin = MOI.ScalarAffineTerm(0.0, list_of_indices[1])
     objfunc_type = typeof(objfunc)
+    print(objfunc)
     # if objfunc_type == MOI.ScalarAffineFunction{Float64}
         
     # end
@@ -238,14 +309,13 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                 push!(dest.variable_lbounds, lbound_value)
                 push!(dest.variable_ubounds, Inf)
             end
-            # println()
             func = MOI.get(src, MOI.ConstraintFunction(), ci)
             set = MOI.get(src, MOI.ConstraintSet(), ci)
             MOI.add_constraint(dest, func, set)
         end
     end
 
-
+    println(dest.variable_lbounds, " ", dest.variable_ubounds)
     # normalize(dest.qpblock)
     dest.status, dest.primal_status, dest.dual_status, dest.solve_time, dest.primal, dest.dual = solve_pddyn(dest.qpblock,
                                                                                                              N, 
@@ -253,8 +323,8 @@ function MOI.optimize!(dest::Optimizer, src::MOI.ModelLike)
                                                                                                              dest.variable_ubounds,
                                                                                                              verbose=!dest.silent,
                                                                                                              τ=1e-5,
-                                                                                                             tstop=10000.,
-                                                                                                             log_freq=500_000)
+                                                                                                             tstop=20.,
+                                                                                                             log_freq=10_000)
     dest.obj_value = MOI.eval_objective(dest.qpblock, dest.primal)
     return index_map, false
 end
@@ -287,3 +357,4 @@ function to_real_rep(mat)
     copyto!(real_rep, CartesianIndices((N+1:2N, N+1:2N)), G, CartesianIndices((1:N, 1:N)))
     return real_rep
 end
+

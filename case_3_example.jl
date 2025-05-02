@@ -29,14 +29,15 @@ function make_test_model(data, optimizer)
     return test_model
 end
 data = parse_file(power_file)
-for (_, bdict) in data["branch"]
-    delete!(bdict, "rate_a")
-    delete!(bdict, "rate_b")
-    delete!(bdict, "rate_c")
-end
+# for (_, bdict) in data["branch"]
+#     delete!(bdict, "rate_a")
+#     delete!(bdict, "rate_b")
+#     delete!(bdict, "rate_c")
+# end
 
 pm = instantiate_model(data, ACRPowerModel, PowerModels.build_opf);
 model = pm.model.moi_backend
+N = 3
 # set_silent(pm.model)
 result = optimize_model!(pm, optimizer=Ipopt.Optimizer)
 V = vcat([result["solution"]["bus"]["$(i)"]["vr"] for i in 1:3], [result["solution"]["bus"]["$(i)"]["vi"] for i in 1:3])
