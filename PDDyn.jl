@@ -551,7 +551,7 @@ mutable struct PowerFlowProblem
 end
 end
 
-function quantize(p::PowerFlowProblem, bits::Int)
+function quantize(p::PowerFlowProblem, bits::Int, randomize::Bool)
 
         scale = if (bits > 0) 1 / (2^bits) else 0.0 end
         Y = calc_admittance_matrix(data).matrix
@@ -567,31 +567,31 @@ function quantize(p::PowerFlowProblem, bits::Int)
         q_load = []
         v_mag_min = []
         v_mag_max = []
-        s_max = quantize.(p.s_max, scale, p.max_coeff, false)
+        s_max = quantize.(p.s_max, scale, p.max_coeff, randomize)
         reference_bus = p.reference_bus
         N = size(Y)[1]
-        q = quantize.(p.q, scale, p.max_coeff, false)
-        C = quantize.(p.C, scale, p.max_coeff, false)
+        q = quantize.(p.q, scale, p.max_coeff, randomize)
+        C = quantize.(p.C, scale, p.max_coeff, randomize)
         M = []
         Nbr = length(p.Φbr)
         for (j, (Ψⱼ, Φⱼ, Mⱼ, pd, qd, qmax, qmin, pmax, pmin, vmax, vmin)) in enumerate(zip(
             p.Ψ, p.Φ, p.M, p.p_load, p.q_load, p.q_upper, p.q_lower, p.p_upper, p.p_lower, p.v_mag_max, p.v_mag_min))
-            push!(Ψ, quantize.(Ψⱼ, scale, p.max_coeff, false))
-            push!(Φ, quantize.(Φⱼ, scale, p.max_coeff, false))
+            push!(Ψ, quantize.(Ψⱼ, scale, p.max_coeff, randomize))
+            push!(Φ, quantize.(Φⱼ, scale, p.max_coeff, randomize))
             
-            push!(p_upper, if pmax < 1e8 quantize(pmax, scale, p.max_coeff, false) else 1e10 end)
-            push!(p_lower, if pmin > -1e8 quantize(pmin, scale, p.max_coeff, false) else -1e10 end)
-            push!(q_upper, if qmax < 1e8 quantize(qmax, scale, p.max_coeff, false) else 1e10 end)
-            push!(q_lower, if qmin > -1e8 quantize(qmin, scale, p.max_coeff, false) else -1e10 end)
-            push!(p_load, quantize(pd, scale, p.max_coeff, false))
-            push!(q_load, quantize(qd, scale, p.max_coeff, false))
-            push!(v_mag_min, quantize(vmin, scale, p.max_coeff, false))
-            push!(v_mag_max, quantize(vmax, scale,p.max_coeff, false))
-            push!(M, quantize.(Mⱼ, scale,p.max_coeff, false))
+            push!(p_upper, if pmax < 1e8 quantize(pmax, scale, p.max_coeff, randomize) else 1e10 end)
+            push!(p_lower, if pmin > -1e8 quantize(pmin, scale, p.max_coeff, randomize) else -1e10 end)
+            push!(q_upper, if qmax < 1e8 quantize(qmax, scale, p.max_coeff, randomize) else 1e10 end)
+            push!(q_lower, if qmin > -1e8 quantize(qmin, scale, p.max_coeff, randomize) else -1e10 end)
+            push!(p_load, quantize(pd, scale, p.max_coeff, randomize))
+            push!(q_load, quantize(qd, scale, p.max_coeff, randomize))
+            push!(v_mag_min, quantize(vmin, scale, p.max_coeff, randomize))
+            push!(v_mag_max, quantize(vmax, scale,p.max_coeff, randomize))
+            push!(M, quantize.(Mⱼ, scale,p.max_coeff, randomize))
         end
         for (j, (Ψⱼ, Φⱼ, sⱼ)) in enumerate(zip(p.Ψbr, p.Φbr, p.s_max)) 
-            push!(Ψbr, quantize.(Ψⱼ, scale, p.max_coeff, false))
-            push!(Φbr, quantize.(Φⱼ, scale, p.max_coeff, false))
+            push!(Ψbr, quantize.(Ψⱼ, scale, p.max_coeff, randomize))
+            push!(Φbr, quantize.(Φⱼ, scale, p.max_coeff, randomize))
         end
         return PowerFlowProblem(
             N,
